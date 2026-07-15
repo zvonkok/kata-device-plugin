@@ -1,7 +1,7 @@
 IMAGE ?= kata-device-plugin
 TAG   ?= latest
 
-.PHONY: build image push clippy fmt test test-unit test-integration clean
+.PHONY: build image push clippy fmt test test-unit test-integration deploy undeploy clean
 
 build:
 	cargo build --release
@@ -29,6 +29,17 @@ image:
 
 push:
 	docker push $(IMAGE):$(TAG)
+
+# Apply RBAC, ConfigMap and DaemonSet to the current kubectl context.
+deploy:
+	kubectl apply -f deploy/rbac.yaml
+	kubectl apply -f deploy/configmap.yaml
+	kubectl apply -f deploy/daemonset.yaml
+
+undeploy:
+	kubectl delete --ignore-not-found -f deploy/daemonset.yaml
+	kubectl delete --ignore-not-found -f deploy/configmap.yaml
+	kubectl delete --ignore-not-found -f deploy/rbac.yaml
 
 clean:
 	cargo clean

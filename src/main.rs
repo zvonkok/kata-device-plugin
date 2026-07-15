@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Node;
 use kube::{runtime::watcher, Api, Client};
 use notify::{RecursiveMode, Watcher};
 use plugin::{DeviceServer, Mode};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -32,8 +31,13 @@ struct Args {
 }
 
 fn select_mode(labels: &BTreeMap<String, String>) -> Mode {
-    match labels.get(labels::LABEL_GPU_CLIQUE).filter(|v| !v.is_empty()) {
-        Some(clique_id) => Mode::Imex { clique_id: clique_id.clone() },
+    match labels
+        .get(labels::LABEL_GPU_CLIQUE)
+        .filter(|v| !v.is_empty())
+    {
+        Some(clique_id) => Mode::Imex {
+            clique_id: clique_id.clone(),
+        },
         None => Mode::Pgpu,
     }
 }
@@ -56,43 +60,53 @@ fn config_file_watcher(path: &Path) -> anyhow::Result<(impl Watcher, mpsc::Recei
     Ok((watcher, rx))
 }
 
-/// Start one DeviceServer per enabled resource and run them under a shared
-/// CancellationToken.  Returns when all servers exit or the token fires.
-async fn run_plugins(cfg: &Config, mode: Mode, token: CancellationToken) {
-    let mut set = JoinSet::new();
-
-    let gpu = DeviceServer::new(
+/// Run one DeviceServer per enabled resource until the token fires.
+async fn run_plugins(cfg: Config, mode: Mode, token: CancellationToken) {
+    let mut servers = vec![DeviceServer::new(
         &cfg.gpu.resource_name,
-        &cfg.gpu.device_dir,
-        &cfg.plugin.socket_dir,
+        plugin::VFIO_DIR,
+        plugin::SOCKET_DIR,
         &cfg.plugin.cdi_dir,
         mode,
-    );
-    let tok = token.clone();
-    set.spawn(async move {
-        if let Err(e) = gpu.run(tok).await {
-            warn!(resource = "gpu", %e, "plugin error");
-        }
-    });
-
+    )];
     if cfg.nvswitch.enabled {
         // NVSwitch is always plain passthrough — it has no IMEX role.
-        let sw = DeviceServer::new(
+        servers.push(DeviceServer::new(
             &cfg.nvswitch.resource_name,
-            &cfg.nvswitch.device_dir,
-            &cfg.plugin.socket_dir,
+            plugin::VFIO_DIR,
+            plugin::SOCKET_DIR,
             &cfg.plugin.cdi_dir,
             Mode::Pgpu,
-        );
-        let tok = token.clone();
-        set.spawn(async move {
-            if let Err(e) = sw.run(tok).await {
-                warn!(resource = "nvswitch", %e, "plugin error");
-            }
-        });
+        ));
     }
+    let results =
+        futures::future::join_all(servers.into_iter().map(|s| s.run(token.clone()))).await;
+    for res in results {
+        if let Err(e) = res {
+            warn!(%e, "plugin error");
+        }
+    }
+}
 
-    while set.join_next().await.is_some() {}
+/// Stop the running plugin task (if any), wait for it to release its sockets
+/// and clean up its CDI specs, then start a fresh one.
+async fn restart(
+    task: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+    cfg: Config,
+    mode: Mode,
+) {
+    if let Some((tok, handle)) = task.take() {
+        tok.cancel();
+        let _ = handle.await;
+    }
+    info!(
+        mode = mode.name(),
+        nvswitch = cfg.nvswitch.enabled,
+        "starting plugins"
+    );
+    let tok = CancellationToken::new();
+    let handle = tokio::spawn(run_plugins(cfg, mode, tok.clone()));
+    *task = Some((tok, handle));
 }
 
 #[tokio::main]
@@ -125,38 +139,6 @@ async fn main() -> anyhow::Result<()> {
     run(&args, shutdown).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
-    #[test]
-    fn no_clique_label_gives_pgpu() {
-        assert_eq!(select_mode(&labels(&[])), Mode::Pgpu);
-        assert_eq!(select_mode(&labels(&[("unrelated", "value")])), Mode::Pgpu);
-    }
-
-    #[test]
-    fn clique_label_gives_imex() {
-        let l = labels(&[(labels::LABEL_GPU_CLIQUE, "7b968a6d-c8aa-45e1-9e70-e1e51be99c31.1")]);
-        assert_eq!(
-            select_mode(&l),
-            Mode::Imex { clique_id: "7b968a6d-c8aa-45e1-9e70-e1e51be99c31.1".to_owned() }
-        );
-    }
-
-    #[test]
-    fn empty_clique_label_gives_pgpu() {
-        // GFD only writes the label when GPU_FABRIC_STATE_COMPLETED; an empty
-        // value means the label exists but fabric init is not done.
-        let l = labels(&[(labels::LABEL_GPU_CLIQUE, "")]);
-        assert_eq!(select_mode(&l), Mode::Pgpu);
-    }
-}
-
 async fn run(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
     let nodes: Api<Node> = Api::all(Client::try_default().await?);
     let watcher_cfg =
@@ -168,22 +150,6 @@ async fn run(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
     let mut active_cfg = Config::load(&args.config);
     let mut active_mode: Option<Mode> = None;
     let mut task: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
-
-    let mut restart = |cfg: Config, mode: Mode, task: &mut Option<(CancellationToken, tokio::task::JoinHandle<()>)>| {
-        if let Some((tok, h)) = task.take() {
-            tok.cancel();
-            // Fire-and-forget: the old task will exit when it sees the cancellation.
-            // We don't await here to keep the closure sync; the JoinHandle is dropped.
-            drop(h);
-        }
-        info!(mode = mode.name(), nvswitch = cfg.nvswitch.enabled, "starting plugins");
-        let tok = CancellationToken::new();
-        let cfg2 = cfg.clone();
-        let mode2 = mode.clone();
-        let tok2 = tok.clone();
-        let h = tokio::spawn(async move { run_plugins(&cfg2, mode2, tok2).await });
-        *task = Some((tok, h));
-    };
 
     loop {
         tokio::select! {
@@ -202,7 +168,7 @@ async fn run(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
                     continue;
                 }
                 active_mode = Some(mode.clone());
-                restart(active_cfg.clone(), mode, &mut task);
+                restart(&mut task, active_cfg.clone(), mode).await;
             }
 
             // Config file change (ConfigMap symlink swap).
@@ -216,7 +182,7 @@ async fn run(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
                 info!("config changed, reloading plugins");
                 active_cfg = new_cfg;
                 if let Some(mode) = active_mode.clone() {
-                    restart(active_cfg.clone(), mode, &mut task);
+                    restart(&mut task, active_cfg.clone(), mode).await;
                 }
             }
         }
@@ -227,4 +193,44 @@ async fn run(args: &Args, shutdown: CancellationToken) -> anyhow::Result<()> {
         let _ = h.await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn no_clique_label_gives_pgpu() {
+        assert_eq!(select_mode(&labels(&[])), Mode::Pgpu);
+        assert_eq!(select_mode(&labels(&[("unrelated", "value")])), Mode::Pgpu);
+    }
+
+    #[test]
+    fn clique_label_gives_imex() {
+        let l = labels(&[(
+            labels::LABEL_GPU_CLIQUE,
+            "7b968a6d-c8aa-45e1-9e70-e1e51be99c31.1",
+        )]);
+        assert_eq!(
+            select_mode(&l),
+            Mode::Imex {
+                clique_id: "7b968a6d-c8aa-45e1-9e70-e1e51be99c31.1".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn empty_clique_label_gives_pgpu() {
+        // GFD only writes the label when GPU_FABRIC_STATE_COMPLETED; an empty
+        // value means the label exists but fabric init is not done.
+        let l = labels(&[(labels::LABEL_GPU_CLIQUE, "")]);
+        assert_eq!(select_mode(&l), Mode::Pgpu);
+    }
 }

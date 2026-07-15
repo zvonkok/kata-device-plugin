@@ -25,7 +25,7 @@ deploy/
 
 - **KISS** — fewer files, fewer abstractions. No trait objects, no dynamic dispatch, no registry pattern. A `match` on a `Mode` enum is enough.
 - **No privileged pods** — the DaemonSet mounts `/dev/vfio` read-only and `/var/lib/kubelet/device-plugins` for the kubelet socket. Nothing else. Isolation is the VM boundary (ADR 10000).
-- **No reconfiguration** — VFIO binding happens on the trusted side. This plugin only reads `/dev/vfio/` to enumerate numeric group entries and report them as healthy `nvidia.com/gpu` devices.
+- **No reconfiguration** — VFIO binding happens on the trusted side. This plugin only reads `/dev/vfio/devices/` to enumerate IOMMUFD cdev entries (`vfio[0-9]+`) and report them as healthy `nvidia.com/gpu` devices. IOMMUFD only — no legacy VFIO group backend. The path is a kernel contract, not configuration.
 
 ## Resource name
 

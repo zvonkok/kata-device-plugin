@@ -17,18 +17,18 @@ use tracing::info;
 ///
 /// `vfio_dir` is the parent VFIO directory (e.g. `/dev/vfio`); this
 /// function scans `<vfio_dir>/devices/` for `vfio[0-9]+` entries.
-pub fn write_cdi_spec(
-    resource_name: &str,
-    vfio_dir: &Path,
-    cdi_dir: &Path,
-) -> anyhow::Result<()> {
+pub fn write_cdi_spec(resource_name: &str, vfio_dir: &Path, cdi_dir: &Path) -> anyhow::Result<()> {
     let devices_dir = vfio_dir.join("devices");
 
     let mut vfio_nums: Vec<u32> = std::fs::read_dir(&devices_dir)
         .with_context(|| format!("read {}", devices_dir.display()))?
         .flatten()
         .filter_map(|e| {
-            e.file_name().to_str()?.strip_prefix("vfio")?.parse::<u32>().ok()
+            e.file_name()
+                .to_str()?
+                .strip_prefix("vfio")?
+                .parse::<u32>()
+                .ok()
         })
         .collect();
     vfio_nums.sort();
@@ -44,7 +44,10 @@ pub fn write_cdi_spec(
         .iter()
         .enumerate()
         .map(|(idx, n)| {
-            let path = devices_dir.join(format!("vfio{n}")).to_string_lossy().into_owned();
+            let path = devices_dir
+                .join(format!("vfio{n}"))
+                .to_string_lossy()
+                .into_owned();
             format!(
                 "  - name: \"{idx}\"\n\
                  \x20   containerEdits:\n\
@@ -73,15 +76,13 @@ pub fn write_cdi_spec(
     let spec: CdiSpec = serde_yaml::from_str(&yaml).context("parse CDI spec")?;
     validate_spec(&spec).context("validate CDI spec")?;
 
-    std::fs::create_dir_all(cdi_dir)
-        .with_context(|| format!("create {}", cdi_dir.display()))?;
+    std::fs::create_dir_all(cdi_dir).with_context(|| format!("create {}", cdi_dir.display()))?;
 
     // File name: "nvidia.com/gpu" → "nvidia.com-gpu.yaml"
     let file_name = format!("{}.yaml", resource_name.replace('/', "-"));
     let out_path = cdi_dir.join(&file_name);
     let out_yaml = serde_yaml::to_string(&spec).context("serialize CDI spec")?;
-    std::fs::write(&out_path, out_yaml)
-        .with_context(|| format!("write {}", out_path.display()))?;
+    std::fs::write(&out_path, out_yaml).with_context(|| format!("write {}", out_path.display()))?;
 
     info!(
         path = %out_path.display(),
@@ -118,8 +119,9 @@ mod tests {
 
         let contents = std::fs::read_to_string(&out).unwrap();
         assert!(contents.contains("kind: nvidia.com/gpu"));
-        assert!(contents.contains("name: \"0\""));
-        assert!(contents.contains("name: \"1\""));
+        // serde_yaml quotes numeric-looking strings with single quotes.
+        assert!(contents.contains("name: '0'"));
+        assert!(contents.contains("name: '1'"));
         assert!(contents.contains("vfio8"));
         assert!(contents.contains("vfio9"));
         assert!(contents.contains("/dev/iommu"));
@@ -133,14 +135,13 @@ mod tests {
 
         write_cdi_spec("nvidia.com/gpu", vfio.path(), cdi_dir.path()).unwrap();
 
-        let contents =
-            std::fs::read_to_string(cdi_dir.path().join("nvidia.com-gpu.yaml")).unwrap();
+        let contents = std::fs::read_to_string(cdi_dir.path().join("nvidia.com-gpu.yaml")).unwrap();
         // Sorted numerically: vfio7, vfio42, vfio100 → indices 0, 1, 2
-        assert!(contents.contains("name: \"0\""));
-        assert!(contents.contains("name: \"1\""));
-        assert!(contents.contains("name: \"2\""));
+        assert!(contents.contains("name: '0'"));
+        assert!(contents.contains("name: '1'"));
+        assert!(contents.contains("name: '2'"));
         // vfio7 must map to index 0 (it's the lowest)
-        let idx0 = contents.find("name: \"0\"").unwrap();
+        let idx0 = contents.find("name: '0'").unwrap();
         let vfio7_pos = contents.find("vfio7").unwrap();
         assert!(vfio7_pos > idx0, "vfio7 should appear after index 0 entry");
     }

@@ -58,18 +58,11 @@ fn fake_vfio(n: u32) -> TempDir {
     dir
 }
 
-async fn serve_unix<S>(socket_dir: &std::path::Path, name: &str, svc: S) -> PathBuf
-where
-    S: tonic::server::NamedService
-        + tower::Service<
-            http::Request<tonic::transport::Body>,
-            Response = http::Response<tonic::body::BoxBody>,
-            Error = std::convert::Infallible,
-        > + Clone
-        + Send
-        + 'static,
-    <S as tower::Service<http::Request<tonic::transport::Body>>>::Future: Send,
-{
+async fn serve_unix(
+    socket_dir: &std::path::Path,
+    name: &str,
+    svc: RegistrationServer<MockKubelet>,
+) -> PathBuf {
     let path = socket_dir.join(name);
     let listener = UnixListener::bind(&path).unwrap();
     let stream = UnixListenerStream::new(listener);
@@ -88,7 +81,13 @@ async fn unix_client(socket_path: PathBuf) -> DevicePluginClient<tonic::transpor
     let channel = Endpoint::try_from("http://[::]:0")
         .unwrap()
         .connect_with_connector(service_fn(move |_: Uri| {
-            tokio::net::UnixStream::connect(socket_path.clone())
+            let socket_path = socket_path.clone();
+            async move {
+                // tonic 0.12 speaks hyper 1.0 IO traits, not tokio's.
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                    tokio::net::UnixStream::connect(socket_path).await?,
+                ))
+            }
         }))
         .await
         .unwrap();
@@ -104,8 +103,15 @@ async fn registers_with_kubelet_and_lists_devices() {
     let vfio_dir = fake_vfio(4); // pretend there are 4 GPUs (vfio0..vfio3)
 
     let registered = Arc::new(Mutex::new(None::<RegisterRequest>));
-    let mock = MockKubelet { registered: registered.clone() };
-    serve_unix(socket_dir.path(), "kubelet.sock", RegistrationServer::new(mock)).await;
+    let mock = MockKubelet {
+        registered: registered.clone(),
+    };
+    serve_unix(
+        socket_dir.path(),
+        "kubelet.sock",
+        RegistrationServer::new(mock),
+    )
+    .await;
 
     let token = CancellationToken::new();
     let server = DeviceServer::new(
@@ -116,11 +122,17 @@ async fn registers_with_kubelet_and_lists_devices() {
         Mode::Pgpu,
     );
     let tok = token.clone();
-    tokio::spawn(async move { server.run(tok).await.ok(); });
+    tokio::spawn(async move {
+        server.run(tok).await.ok();
+    });
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let reg = registered.lock().unwrap().clone().expect("plugin did not register");
+    let reg = registered
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("plugin did not register");
     assert_eq!(reg.resource_name, "nvidia.com/gpu");
     assert_eq!(reg.endpoint, "kata-gpu.sock");
     assert_eq!(reg.version, "v1beta1");
@@ -141,7 +153,9 @@ async fn registers_with_kubelet_and_lists_devices() {
 
     assert_eq!(resp.devices.len(), 4, "expected 4 devices");
     // IDs must be sequential integers matching CDI spec indices.
-    let mut ids: Vec<u32> = resp.devices.iter()
+    let mut ids: Vec<u32> = resp
+        .devices
+        .iter()
         .map(|d| d.id.parse::<u32>().expect("device ID must be a number"))
         .collect();
     ids.sort();
@@ -151,7 +165,10 @@ async fn registers_with_kubelet_and_lists_devices() {
     }
 
     // CDI spec must have been written.
-    assert!(cdi_dir.path().join("nvidia.com-gpu.yaml").exists(), "CDI spec not written");
+    assert!(
+        cdi_dir.path().join("nvidia.com-gpu.yaml").exists(),
+        "CDI spec not written"
+    );
 
     token.cancel();
 }
@@ -163,7 +180,12 @@ async fn allocate_returns_cdi_device_names() {
     let vfio_dir = fake_vfio(2);
 
     let mock = MockKubelet::default();
-    serve_unix(socket_dir.path(), "kubelet.sock", RegistrationServer::new(mock)).await;
+    serve_unix(
+        socket_dir.path(),
+        "kubelet.sock",
+        RegistrationServer::new(mock),
+    )
+    .await;
 
     let token = CancellationToken::new();
     let server = DeviceServer::new(
@@ -174,7 +196,9 @@ async fn allocate_returns_cdi_device_names() {
         Mode::Pgpu,
     );
     let tok = token.clone();
-    tokio::spawn(async move { server.run(tok).await.ok(); });
+    tokio::spawn(async move {
+        server.run(tok).await.ok();
+    });
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -211,7 +235,12 @@ async fn imex_mode_lists_devices() {
     let vfio_dir = fake_vfio(4);
 
     let mock = MockKubelet::default();
-    serve_unix(socket_dir.path(), "kubelet.sock", RegistrationServer::new(mock)).await;
+    serve_unix(
+        socket_dir.path(),
+        "kubelet.sock",
+        RegistrationServer::new(mock),
+    )
+    .await;
 
     let token = CancellationToken::new();
     let server = DeviceServer::new(
@@ -219,10 +248,14 @@ async fn imex_mode_lists_devices() {
         vfio_dir.path().to_str().unwrap(),
         socket_dir.path().to_str().unwrap(),
         cdi_dir.path().to_str().unwrap(),
-        Mode::Imex { clique_id: "7b968a6d-c8aa-45e1-9e70-e1e51be99c31.1".to_owned() },
+        Mode::Imex {
+            clique_id: "7b968a6d-c8aa-45e1-9e70-e1e51be99c31.1".to_owned(),
+        },
     );
     let tok = token.clone();
-    tokio::spawn(async move { server.run(tok).await.ok(); });
+    tokio::spawn(async move {
+        server.run(tok).await.ok();
+    });
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -251,7 +284,12 @@ async fn empty_vfio_dir_advertises_no_devices() {
     let vfio_dir = fake_vfio(0);
 
     let mock = MockKubelet::default();
-    serve_unix(socket_dir.path(), "kubelet.sock", RegistrationServer::new(mock)).await;
+    serve_unix(
+        socket_dir.path(),
+        "kubelet.sock",
+        RegistrationServer::new(mock),
+    )
+    .await;
 
     let token = CancellationToken::new();
     let server = DeviceServer::new(
@@ -262,7 +300,9 @@ async fn empty_vfio_dir_advertises_no_devices() {
         Mode::Pgpu,
     );
     let tok = token.clone();
-    tokio::spawn(async move { server.run(tok).await.ok(); });
+    tokio::spawn(async move {
+        server.run(tok).await.ok();
+    });
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 

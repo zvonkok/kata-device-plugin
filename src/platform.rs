@@ -43,12 +43,12 @@ impl Platform {
 
     pub fn name(&self) -> &str {
         match self {
-            Platform::HgxH100    => "HGX H100",
-            Platform::HgxB200    => "HGX B200",
-            Platform::HgxB300    => "HGX B300",
+            Platform::HgxH100 => "HGX H100",
+            Platform::HgxB200 => "HGX B200",
+            Platform::HgxB300 => "HGX B300",
             Platform::Gb200Nvl72 => "GB200 NVL72",
-            Platform::Gb300      => "GB300",
-            Platform::VeraRubin  => "Vera Rubin",
+            Platform::Gb300 => "GB300",
+            Platform::VeraRubin => "Vera Rubin",
             Platform::Unknown(s) => s.as_str(),
         }
     }
@@ -58,12 +58,12 @@ impl Platform {
     ///       returning the static known value per SKU.
     pub fn nvlink_partitions(&self) -> Option<u32> {
         match self {
-            Platform::HgxH100    => Some(1),
-            Platform::HgxB200    => Some(1),
-            Platform::HgxB300    => Some(1),
+            Platform::HgxH100 => Some(1),
+            Platform::HgxB200 => Some(1),
+            Platform::HgxB300 => Some(1),
             Platform::Gb200Nvl72 => Some(1),
-            Platform::Gb300      => Some(1),
-            Platform::VeraRubin  => Some(1),
+            Platform::Gb300 => Some(1),
+            Platform::VeraRubin => Some(1),
             Platform::Unknown(_) => None,
         }
     }

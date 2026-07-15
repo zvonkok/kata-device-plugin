@@ -21,6 +21,16 @@ use crate::dp::v1beta1::{
 
 const HEALTHY: &str = "Healthy";
 
+/// Where the kernel exposes VFIO; IOMMUFD cdevs live under
+/// `/dev/vfio/devices/`.  Not configurable — the kernel decides.
+/// Tests inject a temp dir via `DeviceServer::new` instead.
+pub const VFIO_DIR: &str = "/dev/vfio";
+
+/// Where the kubelet serves its registration socket and scans for plugin
+/// sockets.  Not configurable — the device plugin API decides.
+/// Tests inject a temp dir via `DeviceServer::new` instead.
+pub const SOCKET_DIR: &str = "/var/lib/kubelet/device-plugins";
+
 /// Derive a unique socket filename from the resource name.
 /// "nvidia.com/gpu" → "kata-gpu.sock", "nvidia.com/nvswitch" → "kata-nvswitch.sock"
 fn socket_name(resource_name: &str) -> String {
@@ -30,7 +40,7 @@ fn socket_name(resource_name: &str) -> String {
 
 /// Which platform behaviour to activate.
 /// Derived from the `nvidia.com/gpu.clique` label written by GFD.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     /// Plain GPU passthrough — no `nvidia.com/gpu.clique` label on the node.
     Pgpu,
@@ -83,11 +93,7 @@ impl DeviceServer {
 
         // Write the host-side CDI spec before binding the socket so the Kata
         // shim can resolve our CDI device names as soon as we register.
-        if let Err(e) = cdi::write_cdi_spec(
-            &self.resource_name,
-            &self.device_dir,
-            &self.cdi_dir,
-        ) {
+        if let Err(e) = cdi::write_cdi_spec(&self.resource_name, &self.device_dir, &self.cdi_dir) {
             tracing::warn!(%e, "CDI spec write failed, continuing without it");
         }
 
@@ -98,16 +104,18 @@ impl DeviceServer {
             UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?,
         );
 
-        info!(resource = %self.resource_name, %socket, "plugin server starting");
+        info!(resource = %self.resource_name, socket = %socket.display(), "plugin server starting");
 
-        let kubelet = self.socket_dir.join("kubelet.sock").to_string_lossy().into_owned();
-        let resource = self.resource_name.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Err(e) = register(&kubelet, &resource, &sock_name).await {
-                tracing::warn!(%e, "kubelet registration failed");
-            }
-        });
+        // Register inline: our socket is already bound, so the kubelet's
+        // dial-back queues in the listener backlog until serving starts below.
+        let kubelet = self
+            .socket_dir
+            .join("kubelet.sock")
+            .to_string_lossy()
+            .into_owned();
+        if let Err(e) = register(&kubelet, &self.resource_name, &sock_name).await {
+            tracing::warn!(%e, "kubelet registration failed");
+        }
 
         Server::builder()
             .add_service(DevicePluginServer::new(self.clone()))
@@ -124,9 +132,9 @@ impl DeviceServer {
         // this plugin does not signal peer nodes, and the IMEX mesh may be in
         // a partially-torn state.  Revisit when NVLink partition lifecycle
         // (join / leave / reconfigure) is fully specced.
-        let cdi_file = self.cdi_dir.join(
-            format!("{}.yaml", self.resource_name.replace('/', "-"))
-        );
+        let cdi_file = self
+            .cdi_dir
+            .join(format!("{}.yaml", self.resource_name.replace('/', "-")));
         if let Err(e) = tokio::fs::remove_file(&cdi_file).await {
             tracing::warn!(%e, path = %cdi_file.display(), "CDI spec removal on shutdown failed");
         } else {
@@ -139,6 +147,12 @@ impl DeviceServer {
     /// Enumerate IOMMUFD char devices under `<device_dir>/devices/`.
     /// Entries matching `vfio[0-9]+` are sorted numerically and assigned
     /// sequential device IDs `"0"`, `"1"`, ... that match CDI spec indices.
+    ///
+    /// TODO: GPU and NVSwitch both scan the same kernel directory, so with
+    /// nvswitch enabled every device is currently advertised under both
+    /// resource names.  Classify each vfioN via sysfs
+    /// (/sys/class/vfio-dev/vfioN/device → PCI vendor/class: 0x10de + 0x0302xx
+    /// = GPU, 0x10de + 0x0680xx = NVSwitch) and filter per resource.
     fn devices(&self) -> Vec<Device> {
         let devices_dir = self.device_dir.join("devices");
         let Ok(rd) = std::fs::read_dir(&devices_dir) else {
@@ -147,7 +161,11 @@ impl DeviceServer {
         let mut vfio_nums: Vec<u32> = rd
             .flatten()
             .filter_map(|e| {
-                e.file_name().to_str()?.strip_prefix("vfio")?.parse::<u32>().ok()
+                e.file_name()
+                    .to_str()?
+                    .strip_prefix("vfio")?
+                    .parse::<u32>()
+                    .ok()
             })
             .collect();
         vfio_nums.sort();
@@ -169,7 +187,13 @@ async fn register(kubelet_sock: &str, resource_name: &str, endpoint: &str) -> an
     let sock = kubelet_sock.to_owned();
     let channel = Endpoint::try_from("http://[::]:0")?
         .connect_with_connector(service_fn(move |_: Uri| {
-            tokio::net::UnixStream::connect(sock.clone())
+            let sock = sock.clone();
+            async move {
+                // tonic 0.12 speaks hyper 1.0 IO traits, not tokio's.
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                    tokio::net::UnixStream::connect(sock).await?,
+                ))
+            }
         }))
         .await
         .context("connect to kubelet")?;
@@ -206,7 +230,9 @@ impl DevicePlugin for DeviceServer {
         &self,
         _: Request<Empty>,
     ) -> Result<Response<Self::ListAndWatchStream>, Status> {
-        let resp = ListAndWatchResponse { devices: self.devices() };
+        let resp = ListAndWatchResponse {
+            devices: self.devices(),
+        };
         let stream = futures::stream::once(futures::future::ready(Ok(resp)));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -234,12 +260,16 @@ impl DevicePlugin for DeviceServer {
                 cdi_devices: cr
                     .devices_i_ds
                     .into_iter()
-                    .map(|id| CdiDevice { name: format!("{resource_name}={id}") })
+                    .map(|id| CdiDevice {
+                        name: format!("{resource_name}={id}"),
+                    })
                     .collect(),
                 ..Default::default()
             })
             .collect();
-        Ok(Response::new(AllocateResponse { container_responses: responses }))
+        Ok(Response::new(AllocateResponse {
+            container_responses: responses,
+        }))
     }
 
     async fn pre_start_container(

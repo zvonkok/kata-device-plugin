@@ -3,7 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 use tracing::warn;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
     pub gpu: GpuConfig,
@@ -15,7 +15,6 @@ pub struct Config {
 #[serde(default)]
 pub struct GpuConfig {
     pub resource_name: String,
-    pub device_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -23,31 +22,18 @@ pub struct GpuConfig {
 pub struct NvswitchConfig {
     pub enabled: bool,
     pub resource_name: String,
-    pub device_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PluginConfig {
-    pub socket_dir: String,
     pub cdi_dir: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            gpu: GpuConfig::default(),
-            nvswitch: NvswitchConfig::default(),
-            plugin: PluginConfig::default(),
-        }
-    }
 }
 
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             resource_name: "nvidia.com/gpu".to_owned(),
-            device_dir: "/dev/vfio".to_owned(),
         }
     }
 }
@@ -57,7 +43,6 @@ impl Default for NvswitchConfig {
         Self {
             enabled: false,
             resource_name: "nvidia.com/nvswitch".to_owned(),
-            device_dir: "/dev/vfio".to_owned(),
         }
     }
 }
@@ -65,7 +50,6 @@ impl Default for NvswitchConfig {
 impl Default for PluginConfig {
     fn default() -> Self {
         Self {
-            socket_dir: "/var/lib/kubelet/device-plugins".to_owned(),
             cdi_dir: "/var/run/cdi".to_owned(),
         }
     }
@@ -108,43 +92,49 @@ mod tests {
     #[test]
     fn full_override() {
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, r#"
+        write!(
+            f,
+            r#"
             [gpu]
             resource_name = "example.com/gpu"
-            device_dir = "/tmp/vfio"
 
             [nvswitch]
             enabled = true
             resource_name = "example.com/nvswitch"
-            device_dir = "/tmp/vfio"
 
             [plugin]
-            socket_dir = "/tmp/dp"
             cdi_dir = "/tmp/cdi"
-        "#).unwrap();
+        "#
+        )
+        .unwrap();
         let cfg = Config::load(f.path());
         assert_eq!(cfg.gpu.resource_name, "example.com/gpu");
-        assert_eq!(cfg.gpu.device_dir, "/tmp/vfio");
         assert!(cfg.nvswitch.enabled);
         assert_eq!(cfg.nvswitch.resource_name, "example.com/nvswitch");
-        assert_eq!(cfg.plugin.socket_dir, "/tmp/dp");
         assert_eq!(cfg.plugin.cdi_dir, "/tmp/cdi");
     }
 
     #[test]
     fn partial_override_keeps_defaults() {
         let mut f = NamedTempFile::new().unwrap();
-        write!(f, r#"
+        write!(
+            f,
+            r#"
             [nvswitch]
             enabled = true
-        "#).unwrap();
+        "#
+        )
+        .unwrap();
         let cfg = Config::load(f.path());
         // Unmentioned sections keep their defaults.
         assert_eq!(cfg.gpu, GpuConfig::default());
         assert_eq!(cfg.plugin, PluginConfig::default());
         assert!(cfg.nvswitch.enabled);
         // Unmentioned fields within the section keep their defaults.
-        assert_eq!(cfg.nvswitch.resource_name, NvswitchConfig::default().resource_name);
+        assert_eq!(
+            cfg.nvswitch.resource_name,
+            NvswitchConfig::default().resource_name
+        );
     }
 
     #[test]
@@ -171,5 +161,4 @@ mod tests {
         assert_ne!(cfg1, cfg2);
         assert_eq!(cfg2.gpu.resource_name, "b.com/gpu");
     }
-}
 }
