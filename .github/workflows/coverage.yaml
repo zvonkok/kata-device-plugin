@@ -1,0 +1,85 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+name: Code Coverage
+
+jobs:
+  # Docs-only changes must not pay for the test suite.  Named uniquely: the
+  # CI workflow also has a "Detect changes" job, and required status checks
+  # match check names globally.
+  changes:
+    name: Detect changes (coverage)
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/*.toml'
+              - '**/*.lock'
+              - 'proto/**'
+              - 'build.rs'
+              - '.github/workflows/coverage.yaml'
+
+  coverage:
+    name: Code coverage
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # tonic codegen in build.rs needs protoc.
+      - run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      # src/main.rs is exempt: start-servers-and-wait wiring that only runs
+      # end-to-end against a real kubelet.
+      - name: Generate coverage
+        run: cargo llvm-cov --locked --all-targets --ignore-filename-regex 'src/main\.rs$' --lcov --output-path lcov.info
+
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@cfd0633edbd2411b532b808ba7a8b5e04f76d2c8 # v2.3.4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: lcov.info
+          format: lcov
+
+      # Gate after the upload so Coveralls still receives the report when the
+      # threshold fails.  Baseline at adoption: 94.2% total, worst file 90.4%
+      # (plugin.rs) — the per-file bound stops an aggregate score from
+      # masking an under-tested module.
+      - name: Enforce minimum line coverage (90% total, 85% per file)
+        run: cargo llvm-cov report --fail-under-lines 90 --fail-under-file-lines 85 --ignore-filename-regex 'src/main\.rs$'

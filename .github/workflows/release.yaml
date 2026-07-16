@@ -1,0 +1,71 @@
+name: Release image
+
+# Builds the container natively on each architecture (no QEMU) and stitches
+# one multi-arch manifest: GB200 nodes pull arm64, HGX nodes pull amd64.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push per-arch image
+        run: |
+          set -euxo pipefail
+          GIT_SHA=$(git rev-parse --short HEAD)
+          docker build -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
+          docker push "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}"
+
+  manifest:
+    name: Multi-arch manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stitch and tag
+        run: |
+          set -euxo pipefail
+          GIT_SHA=$(git rev-parse --short HEAD)
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          docker buildx imagetools create \
+            -t "${IMAGE}:v${VERSION}" \
+            -t "${IMAGE}:${GIT_SHA}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"

@@ -1,0 +1,100 @@
+name: PR CI
+on:
+  # Use pull_request (not pull_request_target) so the workflow definition is
+  # taken from the PR itself. This lets us validate changes to these YAML files
+  # in the PR instead of only discovering breakage after merge. The 'ok-to-test'
+  # label gate below is what limits who gets images built; pull_request also
+  # runs fork PRs with a read-only token and no secrets, which is safer (a
+  # fork PR's read-only token cannot push to ghcr, so the gate matters).
+  pull_request:
+    branches:
+      - 'main'
+    types:
+      # 'labeled' added to the default activity types so the workflow runs
+      # when the 'ok-to-test' label is applied.
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Detect if only docs changed - skip CI if so.
+  # Only run if ok-to-test label present (gate for image publishing).
+  changes:
+    name: Detect changes
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') }}
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Check out the PR head (not the merge commit) to detect changes
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Fetch enough history to compare with base
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          # Explicitly specify base and ref to compare PR head against base
+          base: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/*.toml'
+              - '**/*.lock'
+              - 'Cargo.lock'
+              - 'proto/**'
+              - 'Dockerfile'
+              # Action/workflow bumps must build the image too - a broken or
+              # malicious action update would otherwise merge untested.
+              - '.github/workflows/**'
+              - '.github/actions/**'
+
+  ci:
+    needs: changes
+    # Only build/publish if: 1) ok-to-test label present, 2) code changed.
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') && needs.changes.outputs.code == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/ci.yaml
+    with:
+      commit-hash: ${{ github.event.pull_request.head.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
+
+  # Gate job for branch protection - set "Check CI Result" as required status check.
+  # Passes when: CI succeeded OR no code changes (docs-only PR).
+  ci-complete:
+    name: Check CI Result
+    needs: [changes, ci]
+    if: always() && contains(github.event.pull_request.labels.*.name, 'ok-to-test')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check CI result
+        env:
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          CI_RESULT: ${{ needs.ci.result }}
+        run: |
+          # Only an explicit "false" from the changes job counts as a
+          # docs-only PR. An empty value means the changes job itself failed,
+          # and the gate must fail rather than let the PR merge untested.
+          if [[ "${CODE_CHANGED}" == "false" ]]; then
+            echo "✓ No code changes - CI skipped"
+            exit 0
+          fi
+          if [[ "${CI_RESULT}" == "success" ]]; then
+            echo "✓ CI passed"
+            exit 0
+          fi
+          echo "✗ CI failed: ${CI_RESULT} (code changed: '${CODE_CHANGED}')"
+          exit 1

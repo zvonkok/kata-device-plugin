@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use kata_device_plugin::{plugin, vfio};
 
 use std::path::Path;
@@ -14,7 +16,11 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "kata_device_plugin=info".parse().unwrap()),
         )
         .init();
-    info!("kata-device-plugin starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("GIT_SHA"),
+        "kata-device-plugin"
+    );
 
     let shutdown = CancellationToken::new();
     let sd = shutdown.clone();

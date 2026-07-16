@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod cdi;
 pub mod plugin;
 pub mod vfio;

@@ -1,0 +1,97 @@
+name: CI
+
+# Builds the container image from a PR head and pushes it to ghcr.io as
+# :pr<N> (mutable, tracks the PR) and :pr<N>-<sha> (immutable), one native
+# build per architecture — so test nodes (GB200 arm64, HGX amd64) can pull
+# the PR image directly instead of building locally.
+on:
+  workflow_call:
+    inputs:
+      commit-hash:
+        required: true
+        type: string
+      pr-number:
+        required: true
+        type: string
+  # Allow manual runs against a branch (no PR required).
+  workflow_dispatch:
+    inputs:
+      commit-hash:
+        description: "Commit SHA to build (defaults to the dispatched ref)"
+        required: false
+        type: string
+        default: ""
+      pr-number:
+        description: "Tag suffix: image is pushed as :pr<value>"
+        required: false
+        type: string
+        default: "manual"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-image:
+    name: Build image (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # workflow_call always passes commit-hash; workflow_dispatch may
+          # leave it empty, in which case fall back to the dispatched ref.
+          ref: ${{ inputs.commit-hash != '' && inputs.commit-hash || github.sha }}
+          persist-credentials: false
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push per-arch image
+        env:
+          PR: ${{ inputs.pr-number }}
+        run: |
+          set -euxo pipefail
+          GIT_SHA=$(git rev-parse --short HEAD)
+          docker build -t "${IMAGE}:pr${PR}-${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
+          docker push "${IMAGE}:pr${PR}-${GIT_SHA}-${{ matrix.arch }}"
+
+  pr-manifest:
+    name: PR manifest
+    needs: build-image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.commit-hash != '' && inputs.commit-hash || github.sha }}
+          persist-credentials: false
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stitch multi-arch PR manifest
+        env:
+          PR: ${{ inputs.pr-number }}
+        run: |
+          set -euxo pipefail
+          GIT_SHA=$(git rev-parse --short HEAD)
+          docker buildx imagetools create \
+            -t "${IMAGE}:pr${PR}" \
+            -t "${IMAGE}:pr${PR}-${GIT_SHA}" \
+            "${IMAGE}:pr${PR}-${GIT_SHA}-amd64" "${IMAGE}:pr${PR}-${GIT_SHA}-arm64"
+          echo "pull with: ${IMAGE}:pr${PR}" >> "$GITHUB_STEP_SUMMARY"
