@@ -10,6 +10,8 @@ use tower::service_fn;
 use tracing::info;
 
 use crate::cdi;
+use crate::vfio::{self, Resource};
+
 use crate::dp::v1beta1::{
     device_plugin_server::{DevicePlugin, DevicePluginServer},
     registration_client::RegistrationClient,
@@ -19,166 +21,126 @@ use crate::dp::v1beta1::{
     RegisterRequest,
 };
 
-const HEALTHY: &str = "Healthy";
-
-/// Where the kernel exposes VFIO; IOMMUFD cdevs live under
-/// `/dev/vfio/devices/`.  Not configurable — the kernel decides.
-/// Tests inject a temp dir via `DeviceServer::new` instead.
-pub const VFIO_DIR: &str = "/dev/vfio";
-
 /// Where the kubelet serves its registration socket and scans for plugin
 /// sockets.  Not configurable — the device plugin API decides.
 /// Tests inject a temp dir via `DeviceServer::new` instead.
 pub const SOCKET_DIR: &str = "/var/lib/kubelet/device-plugins";
 
-/// Derive a unique socket filename from the resource name.
-/// "nvidia.com/gpu" → "kata-gpu.sock", "nvidia.com/nvswitch" → "kata-nvswitch.sock"
+/// Where the host CDI registry lives; the Kata shim reads it at
+/// SandboxCreate.  A runtime contract, not configuration.
+pub const CDI_DIR: &str = "/var/run/cdi";
+
+/// Every resource needs its own socket in the kubelet's shared plugin dir:
+/// "nvidia.com/gpu" → "kata-gpu.sock".
 fn socket_name(resource_name: &str) -> String {
     let base = resource_name.rsplit('/').next().unwrap_or(resource_name);
     format!("kata-{base}.sock")
 }
 
-/// Which platform behaviour to activate.
-/// Derived from the `nvidia.com/gpu.clique` label written by GFD.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Mode {
-    /// Plain GPU passthrough — no `nvidia.com/gpu.clique` label on the node.
-    Pgpu,
-    /// Multi-node NVLink — `nvidia.com/gpu.clique` is present and GFD confirmed
-    /// GPU_FABRIC_STATE_COMPLETED.
-    Imex { clique_id: String },
-}
-
-impl Mode {
-    pub fn name(&self) -> &str {
-        match self {
-            Mode::Pgpu => "pgpu",
-            Mode::Imex { .. } => "pgpu-imex",
-        }
-    }
-}
-
 /// Single concrete device plugin; tonic requires Clone.
 #[derive(Clone)]
 pub struct DeviceServer {
-    resource_name: String,
-    /// /dev/vfio — IOMMUFD devices are scanned under <device_dir>/devices/
+    resource: Resource,
+    // Path fields rather than the constants so tests can inject temp dirs.
     device_dir: PathBuf,
+    sysfs_dir: PathBuf,
     socket_dir: PathBuf,
     cdi_dir: PathBuf,
-    mode: Mode,
 }
 
 impl DeviceServer {
     pub fn new(
-        resource_name: &str,
+        resource: Resource,
         device_dir: &str,
+        sysfs_dir: &str,
         socket_dir: &str,
         cdi_dir: &str,
-        mode: Mode,
     ) -> Self {
         Self {
-            resource_name: resource_name.to_owned(),
+            resource,
             device_dir: PathBuf::from(device_dir),
+            sysfs_dir: PathBuf::from(sysfs_dir),
             socket_dir: PathBuf::from(socket_dir),
             cdi_dir: PathBuf::from(cdi_dir),
-            mode,
         }
     }
 
     pub async fn run(self, token: CancellationToken) -> anyhow::Result<()> {
-        if let Mode::Imex { ref clique_id } = self.mode {
-            info!(clique_id, "IMEX mode");
-        }
-
         // Write the host-side CDI spec before binding the socket so the Kata
         // shim can resolve our CDI device names as soon as we register.
-        if let Err(e) = cdi::write_cdi_spec(&self.resource_name, &self.device_dir, &self.cdi_dir) {
-            tracing::warn!(%e, "CDI spec write failed, continuing without it");
+        let devices = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource);
+        if let Err(e) = cdi::write_cdi_spec(self.resource.name, &devices, &self.cdi_dir) {
+            tracing::warn!("CDI spec write failed, continuing without it: {e:#}");
         }
 
-        let sock_name = socket_name(&self.resource_name);
+        let sock_name = socket_name(self.resource.name);
         let socket = self.socket_dir.join(&sock_name);
         let _ = tokio::fs::remove_file(&socket).await;
         let stream = UnixListenerStream::new(
             UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?,
         );
 
-        info!(resource = %self.resource_name, socket = %socket.display(), "plugin server starting");
+        info!(resource = self.resource.name, socket = %socket.display(), "plugin server starting");
 
-        // Register inline: our socket is already bound, so the kubelet's
-        // dial-back queues in the listener backlog until serving starts below.
+        // Serve first, register after: the kubelet dials back and probes the
+        // endpoint inside the Register RPC itself, so registering before the
+        // server is live deadlocks until kubelet's 10s dial deadline expires.
+        let mut serve = tokio::spawn(
+            Server::builder()
+                .add_service(DevicePluginServer::new(self.clone()))
+                .serve_with_incoming(stream),
+        );
+
         let kubelet = self
             .socket_dir
             .join("kubelet.sock")
             .to_string_lossy()
             .into_owned();
-        if let Err(e) = register(&kubelet, &self.resource_name, &sock_name).await {
-            tracing::warn!(%e, "kubelet registration failed");
+        if let Err(e) = register(&kubelet, self.resource.name, &sock_name).await {
+            tracing::warn!("kubelet registration failed: {e:#}");
         }
 
-        Server::builder()
-            .add_service(DevicePluginServer::new(self.clone()))
-            .serve_with_incoming_shutdown(stream, token.cancelled())
-            .await?;
+        // No graceful drain on shutdown: we hold the kubelet's ListAndWatch
+        // stream open for the plugin's whole lifetime, so draining would wait
+        // forever.  Abort the server task and clean up instead.
+        tokio::select! {
+            res = &mut serve => res.context("plugin server task")?.context("plugin server")?,
+            _ = token.cancelled() => serve.abort(),
+        }
 
         // Remove the CDI spec on clean shutdown so no stale device paths
         // remain on disk if the node is reconfigured while the plugin is absent.
         // On crash the file stays, but startup always overwrites it with a fresh scan.
-        //
-        // TODO: NVLink / IMEX mode needs more thought here.  In a multi-node
-        // NVLink partition, VFIO renumbering on one node may invalidate CDI
-        // specs on peer nodes that share the same clique.  A clean shutdown of
-        // this plugin does not signal peer nodes, and the IMEX mesh may be in
-        // a partially-torn state.  Revisit when NVLink partition lifecycle
-        // (join / leave / reconfigure) is fully specced.
-        let cdi_file = self
-            .cdi_dir
-            .join(format!("{}.yaml", self.resource_name.replace('/', "-")));
-        if let Err(e) = tokio::fs::remove_file(&cdi_file).await {
-            tracing::warn!(%e, path = %cdi_file.display(), "CDI spec removal on shutdown failed");
-        } else {
-            info!(path = %cdi_file.display(), "removed CDI spec on shutdown");
+        let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
+        match tokio::fs::remove_file(&cdi_file).await {
+            Ok(()) => info!(path = %cdi_file.display(), "removed CDI spec on shutdown"),
+            // Nothing was written (no devices) — nothing to clean up.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(%e, path = %cdi_file.display(), "CDI spec removal on shutdown failed")
+            }
         }
 
         Ok(())
     }
 
-    /// Enumerate IOMMUFD char devices under `<device_dir>/devices/`.
-    /// Entries matching `vfio[0-9]+` are sorted numerically and assigned
-    /// sequential device IDs `"0"`, `"1"`, ... that match CDI spec indices.
-    ///
-    /// TODO: GPU and NVSwitch both scan the same kernel directory, so with
-    /// nvswitch enabled every device is currently advertised under both
-    /// resource names.  Classify each vfioN via sysfs
-    /// (/sys/class/vfio-dev/vfioN/device → PCI vendor/class: 0x10de + 0x0302xx
-    /// = GPU, 0x10de + 0x0680xx = NVSwitch) and filter per resource.
+    /// Device IDs are positions in the sorted enumeration, so they always
+    /// match the CDI spec indices written from the same scan.
     fn devices(&self) -> Vec<Device> {
-        let devices_dir = self.device_dir.join("devices");
-        let Ok(rd) = std::fs::read_dir(&devices_dir) else {
-            return vec![];
-        };
-        let mut vfio_nums: Vec<u32> = rd
-            .flatten()
-            .filter_map(|e| {
-                e.file_name()
-                    .to_str()?
-                    .strip_prefix("vfio")?
-                    .parse::<u32>()
-                    .ok()
-            })
-            .collect();
-        vfio_nums.sort();
-        let devs: Vec<Device> = vfio_nums
+        let devs: Vec<Device> = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource)
             .iter()
             .enumerate()
             .map(|(idx, _)| Device {
                 id: idx.to_string(),
-                health: HEALTHY.to_owned(),
+                health: "Healthy".to_owned(),
                 topology: None,
             })
             .collect();
-        info!(count = devs.len(), "discovered IOMMUFD devices");
+        info!(
+            count = devs.len(),
+            resource = self.resource.name,
+            "discovered IOMMUFD devices"
+        );
         devs
     }
 }
@@ -230,10 +192,16 @@ impl DevicePlugin for DeviceServer {
         &self,
         _: Request<Empty>,
     ) -> Result<Response<Self::ListAndWatchStream>, Status> {
+        use futures::StreamExt;
         let resp = ListAndWatchResponse {
             devices: self.devices(),
         };
-        let stream = futures::stream::once(futures::future::ready(Ok(resp)));
+        // Send one snapshot, then hold the stream open: the kubelet treats a
+        // completed ListAndWatch stream as endpoint death and marks the
+        // resource unhealthy.  The advertised set is fixed for the plugin's
+        // lifetime; a device-set change means the pod is restarted.
+        let stream = futures::stream::once(futures::future::ready(Ok(resp)))
+            .chain(futures::stream::pending());
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -244,14 +212,13 @@ impl DevicePlugin for DeviceServer {
         Ok(Response::new(PreferredAllocationResponse::default()))
     }
 
-    /// Return CDI device names so the container runtime (and Kata's shim)
-    /// know which device index maps to each container.
-    /// Kata's shim resolves these via the host CDI spec we wrote at startup.
+    /// Only CDI names go back to the kubelet — actual device injection is the
+    /// Kata shim's job, resolving them against the host CDI spec.
     async fn allocate(
         &self,
         req: Request<AllocateRequest>,
     ) -> Result<Response<AllocateResponse>, Status> {
-        let resource_name = self.resource_name.clone();
+        let resource_name = self.resource.name;
         let responses = req
             .into_inner()
             .container_requests

@@ -13,20 +13,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 hyper-util = "0.1"
-kube = { version = "0.97", features = ["runtime", "client"] }
-k8s-openapi = { version = "0.23", features = ["v1_31"] }
-container-device-interface = "1.1.1"
-notify = "6"
+# Pinned to the PR #108 merge commit (public spec fields, optional clap,
+# jsonschema without reqwest) until the next crates.io release.
+container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "4de398c8bc49518aa792565a0c62d1b968a7b87c" }
 prost = "0.13"
-serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
-toml = "0.8"
 tonic = "0.12"
 tower = "0.4"
 tracing = "0.1"
