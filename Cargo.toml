@@ -23,7 +23,7 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
-tonic = "0.12"
+tonic = "0.14"
 tower = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
