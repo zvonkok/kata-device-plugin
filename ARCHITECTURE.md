@@ -44,14 +44,9 @@ DRA earns its place when there are real topology constraints — heterogeneous f
 
 ### Why there is no tray-level or aggregate resource
 
-The plugin declares supply; aggregation is consumption policy, and consumption policy belongs to the scheduling layer. On a GB200 compute tray, `nvidia.com/gpu: 4` already *is* the whole tray — whole-node intent is a count plus node labels and taints, all expressed in pod specs and placement policy.
+Deciding what an aggregate *is* — a tray, a half-node, the whole node — is consumption policy, and that decision belongs to the layer above. The scheduler is free to consume the declared devices as a whole (`nvidia.com/gpu: 4` on a GB200 compute tray is the whole tray) or as a subset (`: 2`); the plugin does not pre-empt that choice by bundling devices into units. Whole-node intent is a count plus node labels and taints, expressed in pod specs and placement policy.
 
-A separate `nvidia.com/gb200: 1` resource over the same devices was considered and rejected:
-
-- Two extended resources backed by the same hardware cannot be reconciled: the scheduler keeps independent ledgers, so double-allocation races are structural, and the device plugin API has no deallocation signal with which a "deactivated" sibling resource could ever be re-activated.
-- Selecting an aggregate mode per node would reintroduce exactly the platform knowledge this design removed — something must decide which nodes are "trays", and that something is platform detection in a different coat.
-
-If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model — revisit ADR 1000 rather than emulating it with health-flapping here.
+The mechanics are secondary — two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API) — but even if they could, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
 
 ### Why the plugin does not bind VFIO devices
 
