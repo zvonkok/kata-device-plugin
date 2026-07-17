@@ -20,8 +20,8 @@ A resource is advertised iff matching devices are VFIO-bound — declared by
 the node, not configured. Supporting a new device type is one table row; no
 other code changes.
 
-The plugin declares supply only. How devices are consumed — a whole tray
-(`nvidia.com/gpu: 4` on a GB200 compute tray) or a subset — is a scheduling
+The plugin declares supply only. How devices are consumed, as a whole tray
+(`nvidia.com/gpu: 4` on a GB200 compute tray) or as a subset, is a scheduling
 decision expressed in pod specs, node labels, and taints; the plugin never
 aggregates or partitions what the node declares.
 
