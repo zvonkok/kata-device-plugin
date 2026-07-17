@@ -42,6 +42,12 @@ Trusted and untrusted workloads do not share a cluster. On a Kata/untrusted clus
 
 DRA earns its place when there are real topology constraints — heterogeneous fleets, cross-device matching, per-claim bind/unbind lifecycle. None of those are load-bearing here. Nodes are single-tenant with GPUs in a fixed passthrough state. Vera Rubin removes intra-node board alignment, so VM width is a plain count. A device plugin is the right tool (ADR 1000).
 
+### Why there is no tray-level or aggregate resource
+
+Deciding what an aggregate *is* (a tray, a half-node, the whole node) is consumption policy, and that decision belongs to the layer above. The scheduler is free to consume the declared devices as a whole (`nvidia.com/gpu: 4` on a GB200 compute tray is the whole tray) or as a subset (`nvidia.com/gpu: 2`); the plugin does not pre-empt that choice by bundling devices into units. Whole-node intent is a count plus node labels and taints, expressed in pod specs and placement policy.
+
+The mechanics are secondary: two extended resources over the same hardware also cannot be reconciled (independent scheduler ledgers, no deallocation signal in the device plugin API). Even if they could be, the aggregation decision still would not belong here. If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model: revisit ADR 1000.
+
 ### Why the plugin does not bind VFIO devices
 
 Binding a device is a reconfiguration of the infrastructure. The workload cluster is read-only toward the infrastructure; reconfiguration authority lives in the admin cluster. Placing a component that can bind devices inside the workload cluster would put infrastructure control next to the untrusted workloads it is meant to contain (boundary document, ADR 1000). The device plugin only declares what already exists.
