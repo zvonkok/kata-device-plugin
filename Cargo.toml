@@ -18,7 +18,7 @@ hyper-util = "0.1"
 # Pinned to the PR #108 merge commit (public spec fields, optional clap,
 # jsonschema without reqwest) until the next crates.io release.
 container-device-interface = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "4de398c8bc49518aa792565a0c62d1b968a7b87c" }
-prost = "0.13"
+prost = "0.14"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
