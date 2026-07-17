@@ -42,6 +42,17 @@ Trusted and untrusted workloads do not share a cluster. On a Kata/untrusted clus
 
 DRA earns its place when there are real topology constraints — heterogeneous fleets, cross-device matching, per-claim bind/unbind lifecycle. None of those are load-bearing here. Nodes are single-tenant with GPUs in a fixed passthrough state. Vera Rubin removes intra-node board alignment, so VM width is a plain count. A device plugin is the right tool (ADR 1000).
 
+### Why there is no tray-level or aggregate resource
+
+The plugin declares supply; aggregation is consumption policy, and consumption policy belongs to the scheduling layer. On a GB200 compute tray, `nvidia.com/gpu: 4` already *is* the whole tray — whole-node intent is a count plus node labels and taints, all expressed in pod specs and placement policy.
+
+A separate `nvidia.com/gb200: 1` resource over the same devices was considered and rejected:
+
+- Two extended resources backed by the same hardware cannot be reconciled: the scheduler keeps independent ledgers, so double-allocation races are structural, and the device plugin API has no deallocation signal with which a "deactivated" sibling resource could ever be re-activated.
+- Selecting an aggregate mode per node would reintroduce exactly the platform knowledge this design removed — something must decide which nodes are "trays", and that something is platform detection in a different coat.
+
+If both granularities on one node ever become a hard requirement, that is DRA's partitionable-device model — revisit ADR 1000 rather than emulating it with health-flapping here.
+
 ### Why the plugin does not bind VFIO devices
 
 Binding a device is a reconfiguration of the infrastructure. The workload cluster is read-only toward the infrastructure; reconfiguration authority lives in the admin cluster. Placing a component that can bind devices inside the workload cluster would put infrastructure control next to the untrusted workloads it is meant to contain (boundary document, ADR 1000). The device plugin only declares what already exists.
