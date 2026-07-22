@@ -231,6 +231,11 @@ async fn registers_with_kubelet_and_lists_devices() {
 async fn allocate_returns_cdi_device_names() {
     let node = Node::start(fake_vfio(2), &["nvidia.com/gpu"]).await;
 
+    // No ListAndWatch stream is open, so no poller has written the CDI spec:
+    // Allocate alone must sync it so the names it returns resolve the moment
+    // the shim reads the registry.
+    assert!(node.spec("kata.nvidia.com-gpu.yaml").is_none());
+
     let resp = node
         .client("kata-gpu.sock")
         .await
@@ -253,6 +258,10 @@ async fn allocate_returns_cdi_device_names() {
     // No DeviceSpec — device injection is the Kata shim's job, resolving CDI
     // names against the host spec, not the kubelet's via device paths.
     assert!(resp.container_responses[0].devices.is_empty());
+    assert!(
+        node.spec("kata.nvidia.com-gpu.yaml").is_some(),
+        "Allocate must sync the CDI spec so its names resolve immediately"
+    );
 
     node.shutdown().await;
 }

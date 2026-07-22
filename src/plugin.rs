@@ -120,6 +120,28 @@ impl DeviceServer {
 
         Ok(())
     }
+
+    /// Bring the on-disk CDI spec in line with `devs`: write it from this
+    /// scan, or remove it when no devices remain.  Sync fs work runs off the
+    /// async workers.  Callers decide the failure policy: the poller retries
+    /// on the next tick, Allocate fails the RPC.
+    async fn sync_cdi_spec(&self, devs: &[vfio::IommufdDev]) -> anyhow::Result<()> {
+        if devs.is_empty() {
+            let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
+            match tokio::fs::remove_file(&cdi_file).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("remove {}", cdi_file.display())),
+            }
+        } else {
+            let name = self.resource.name;
+            let devs = devs.to_vec();
+            let dir = self.cdi_dir.clone();
+            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(name, &devs, &dir))
+                .await
+                .context("CDI spec write task")?
+        }
+    }
 }
 
 async fn register(kubelet_sock: &str, resource_name: &str, endpoint: &str) -> anyhow::Result<()> {
@@ -172,7 +194,13 @@ impl DevicePlugin for DeviceServer {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let server = self.clone();
         tokio::spawn(async move {
-            let mut last: Option<Vec<u32>> = None;
+            // Two independent trackers: `sent` is what the kubelet last saw,
+            // `synced` is what the on-disk CDI spec reflects.  A CDI failure
+            // must retry next tick without re-sending an identical device
+            // list every 5s (kubelet churn); a device change must reach the
+            // kubelet even while the CDI registry is briefly unwritable.
+            let mut sent: Option<Vec<u32>> = None;
+            let mut synced: Option<Vec<u32>> = None;
             loop {
                 // Exit when the kubelet drops the stream, even if the device
                 // set never changes again — otherwise this task would poll
@@ -189,46 +217,19 @@ impl DevicePlugin for DeviceServer {
                 // while the CDI spec's index → cdev mapping went stale.
                 let nums: Vec<u32> = vfio_devs.iter().map(|d| d.num).collect();
 
-                if Some(&nums) != last.as_ref() {
+                if Some(&nums) != synced.as_ref() {
+                    match server.sync_cdi_spec(&vfio_devs).await {
+                        Ok(()) => synced = Some(nums.clone()),
+                        Err(e) => tracing::warn!("CDI spec sync failed, retrying: {e:#}"),
+                    }
+                }
+
+                if Some(&nums) != sent.as_ref() {
                     info!(
                         count = nums.len(),
                         resource = server.resource.name,
                         "device list changed"
                     );
-                    let cdi_ok = if vfio_devs.is_empty() {
-                        // The last device vanished: remove the spec so it
-                        // can't resolve to device nodes that no longer exist.
-                        let cdi_file = cdi::spec_path(&server.cdi_dir, server.resource.name);
-                        match tokio::fs::remove_file(&cdi_file).await {
-                            Ok(()) => true,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                            Err(e) => {
-                                tracing::warn!(%e, path = %cdi_file.display(), "stale CDI spec removal failed");
-                                false
-                            }
-                        }
-                    } else {
-                        // write_cdi_spec is sync fs I/O; keep it off the
-                        // async workers so a slow disk can't stall gRPC.
-                        let name = server.resource.name;
-                        let devs = vfio_devs.clone();
-                        let dir = server.cdi_dir.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            cdi::write_cdi_spec(name, &devs, &dir)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => true,
-                            Ok(Err(e)) => {
-                                tracing::warn!("CDI spec write failed: {e:#}");
-                                false
-                            }
-                            Err(e) => {
-                                tracing::warn!("CDI spec write task failed: {e}");
-                                false
-                            }
-                        }
-                    };
                     let devices = (0..nums.len())
                         .map(|idx| Device {
                             id: idx.to_string(),
@@ -236,14 +237,7 @@ impl DevicePlugin for DeviceServer {
                             topology: None,
                         })
                         .collect();
-                    // Send the snapshot regardless — scheduling must track
-                    // reality even if the CDI registry is briefly behind —
-                    // but only mark the set as synced once the CDI spec
-                    // matches it, so a transient write/remove failure is
-                    // retried on the next tick instead of never.
-                    if cdi_ok {
-                        last = Some(nums);
-                    }
+                    sent = Some(nums);
                     if tx.send(Ok(ListAndWatchResponse { devices })).await.is_err() {
                         break;
                     }
@@ -274,7 +268,17 @@ impl DevicePlugin for DeviceServer {
         // The device set can shrink between scheduling and Allocate.  Check
         // the requested IDs against a fresh enumeration so a stale ID fails
         // loudly here instead of as an unresolvable CDI name in the shim.
-        let present = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource).len();
+        let devs = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource);
+        let present = devs.len();
+        // The names below only work if the shim can resolve them at
+        // SandboxCreate.  Sync the spec from the very enumeration we validate
+        // against; if the CDI registry can't be written, fail the RPC now
+        // instead of succeeding and producing an opaque runtime failure.
+        if let Err(e) = self.sync_cdi_spec(&devs).await {
+            return Err(Status::unavailable(format!(
+                "CDI registry for {resource_name} is not writable: {e:#}"
+            )));
+        }
         let mut responses = Vec::new();
         for cr in req.into_inner().container_requests {
             let mut cdi_devices = Vec::new();

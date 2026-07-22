@@ -62,7 +62,13 @@ pub fn write_cdi_spec(
 
     let out_path = spec_path(cdi_dir, resource_name);
     let out_yaml = serde_yaml::to_string(&spec).context("serialize CDI spec")?;
-    std::fs::write(&out_path, out_yaml).with_context(|| format!("write {}", out_path.display()))?;
+    // Write-then-rename: the ListAndWatch poller and Allocate may both write
+    // this spec, and the Kata shim may read it at any moment — a reader must
+    // never see a torn file.
+    let tmp_path = out_path.with_extension("yaml.tmp");
+    std::fs::write(&tmp_path, out_yaml).with_context(|| format!("write {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &out_path)
+        .with_context(|| format!("rename to {}", out_path.display()))?;
 
     info!(
         path = %out_path.display(),
