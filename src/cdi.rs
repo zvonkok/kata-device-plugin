@@ -7,7 +7,7 @@ use container_device_interface::specs::config::{
 };
 use tracing::info;
 
-use crate::vfio::VfioDev;
+use pcilibs_rs::IommufdDev;
 
 /// Path of the CDI spec file for `resource_name` inside `cdi_dir`:
 /// "nvidia.com/gpu" → `<cdi_dir>/kata.nvidia.com-gpu.yaml`.  The `kata.`
@@ -23,7 +23,7 @@ pub fn spec_path(cdi_dir: &Path, resource_name: &str) -> PathBuf {
 /// name itself.
 pub fn write_cdi_spec(
     resource_name: &str,
-    devices: &[VfioDev],
+    devices: &[IommufdDev],
     cdi_dir: &Path,
 ) -> anyhow::Result<()> {
     if devices.is_empty() {
@@ -62,7 +62,20 @@ pub fn write_cdi_spec(
 
     let out_path = spec_path(cdi_dir, resource_name);
     let out_yaml = serde_yaml::to_string(&spec).context("serialize CDI spec")?;
-    std::fs::write(&out_path, out_yaml).with_context(|| format!("write {}", out_path.display()))?;
+    // Write-then-rename: the ListAndWatch poller and Allocate may both write
+    // this spec, and the Kata shim may read it at any moment — a reader must
+    // never see a torn file.  The tmp name is unique per write (pid +
+    // counter) so concurrent writers can't rename each other's bytes or trip
+    // over a shared tmp path.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = out_path.with_extension(format!("yaml.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, out_yaml).with_context(|| format!("write {}", tmp_path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+        // Best effort: don't litter the registry with tmp files on retries.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| format!("rename to {}", out_path.display()));
+    }
 
     info!(
         path = %out_path.display(),
@@ -76,15 +89,14 @@ pub fn write_cdi_spec(
 mod tests {
     use super::*;
     use crate::vfio::{self, testfs, Resource, RESOURCES};
+    use pcilibs_rs::IommufdDev;
     use tempfile::TempDir;
 
     fn by_name(name: &str) -> &'static Resource {
         RESOURCES.iter().find(|r| r.name == name).unwrap()
     }
 
-    /// Create fake GPU cdevs under `root` and return them enumerated —
-    /// same path write_cdi_spec's callers use.
-    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<VfioDev> {
+    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<IommufdDev> {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }
