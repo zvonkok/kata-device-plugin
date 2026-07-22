@@ -257,6 +257,30 @@ async fn allocate_returns_cdi_device_names() {
 }
 
 #[tokio::test]
+async fn allocate_rejects_ids_beyond_present_devices() {
+    // The device set can shrink between scheduling and Allocate; a stale ID
+    // must fail as a clear gRPC error, not as an unresolvable CDI name that
+    // the Kata shim trips over later.
+    let node = Node::start(fake_vfio(2), &["nvidia.com/gpu"]).await;
+
+    remove_dev(node._vfio.path(), 1);
+
+    let err = node
+        .client("kata-gpu.sock")
+        .await
+        .allocate(Request::new(AllocateRequest {
+            container_requests: vec![ContainerAllocateRequest {
+                devices_i_ds: vec!["0".to_owned(), "1".to_owned()],
+            }],
+        }))
+        .await
+        .expect_err("allocate of a vanished device must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
 async fn empty_vfio_dir_advertises_no_devices() {
     let node = Node::start(fake_vfio(0), &["nvidia.com/gpu"]).await;
 

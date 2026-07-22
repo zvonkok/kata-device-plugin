@@ -195,20 +195,28 @@ impl DevicePlugin for DeviceServer {
                         resource = server.resource.name,
                         "device list changed"
                     );
-                    if vfio_devs.is_empty() {
+                    let cdi_ok = if vfio_devs.is_empty() {
                         // The last device vanished: remove the spec so it
                         // can't resolve to device nodes that no longer exist.
                         let cdi_file = cdi::spec_path(&server.cdi_dir, server.resource.name);
-                        if let Err(e) = tokio::fs::remove_file(&cdi_file).await {
-                            if e.kind() != std::io::ErrorKind::NotFound {
+                        match tokio::fs::remove_file(&cdi_file).await {
+                            Ok(()) => true,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                            Err(e) => {
                                 tracing::warn!(%e, path = %cdi_file.display(), "stale CDI spec removal failed");
+                                false
                             }
                         }
-                    } else if let Err(e) =
-                        cdi::write_cdi_spec(server.resource.name, &vfio_devs, &server.cdi_dir)
-                    {
-                        tracing::warn!("CDI spec write failed: {e:#}");
-                    }
+                    } else {
+                        match cdi::write_cdi_spec(server.resource.name, &vfio_devs, &server.cdi_dir)
+                        {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!("CDI spec write failed: {e:#}");
+                                false
+                            }
+                        }
+                    };
                     let devices = (0..nums.len())
                         .map(|idx| Device {
                             id: idx.to_string(),
@@ -216,7 +224,14 @@ impl DevicePlugin for DeviceServer {
                             topology: None,
                         })
                         .collect();
-                    last = Some(nums);
+                    // Send the snapshot regardless — scheduling must track
+                    // reality even if the CDI registry is briefly behind —
+                    // but only mark the set as synced once the CDI spec
+                    // matches it, so a transient write/remove failure is
+                    // retried on the next tick instead of never.
+                    if cdi_ok {
+                        last = Some(nums);
+                    }
                     if tx.send(Ok(ListAndWatchResponse { devices })).await.is_err() {
                         break;
                     }
@@ -244,21 +259,31 @@ impl DevicePlugin for DeviceServer {
         req: Request<AllocateRequest>,
     ) -> Result<Response<AllocateResponse>, Status> {
         let resource_name = self.resource.name;
-        let responses = req
-            .into_inner()
-            .container_requests
-            .into_iter()
-            .map(|cr| ContainerAllocateResponse {
-                cdi_devices: cr
-                    .devices_i_ds
-                    .into_iter()
-                    .map(|id| CdiDevice {
+        // The device set can shrink between scheduling and Allocate.  Check
+        // the requested IDs against a fresh enumeration so a stale ID fails
+        // loudly here instead of as an unresolvable CDI name in the shim.
+        let present = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource).len();
+        let mut responses = Vec::new();
+        for cr in req.into_inner().container_requests {
+            let mut cdi_devices = Vec::new();
+            for id in cr.devices_i_ds {
+                match id.parse::<usize>() {
+                    Ok(idx) if idx < present => cdi_devices.push(CdiDevice {
                         name: format!("{resource_name}={id}"),
-                    })
-                    .collect(),
+                    }),
+                    _ => {
+                        return Err(Status::not_found(format!(
+                            "device {id} of {resource_name} is no longer present \
+                             ({present} devices bound)"
+                        )))
+                    }
+                }
+            }
+            responses.push(ContainerAllocateResponse {
+                cdi_devices,
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
         Ok(Response::new(AllocateResponse {
             container_responses: responses,
         }))
