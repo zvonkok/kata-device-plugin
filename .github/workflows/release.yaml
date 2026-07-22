@@ -9,6 +9,13 @@ name: Release image
 on:
   workflow_dispatch:
 
+# One release at a time, no queue-jumping cancellation: a second dispatch
+# waits instead of racing the first on the latest tag or failing at tag
+# creation because both derived the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions: {}
 
 env:
