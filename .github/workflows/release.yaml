@@ -113,12 +113,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Explicit buildx setup rather than trusting the runner's docker to
+      # alias build → buildx: deterministic across runner image changes.
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
       - name: Build and push per-arch image
         # --push: buildx pushes as part of the build; no separate docker push.
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          docker build --push -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
+          docker buildx build --push -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
 
   manifest:
     name: Multi-arch manifest
