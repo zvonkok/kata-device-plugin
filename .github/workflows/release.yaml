@@ -47,16 +47,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
       - name: Derive tag
         id: version
         # cargo metadata rather than grepping the TOML: immune to formatting,
-        # trailing comments, and workspace layout.  Validate the result
-        # against the Docker tag charset here — a SemVer like 0.3.0+build1
-        # is legal in Cargo.toml but would only fail at the manifest step,
-        # after per-arch images are already pushed.
+        # trailing comments, and workspace layout.  --locked so metadata can
+        # never rewrite Cargo.lock.  Validate the result against the Docker
+        # tag charset here — a SemVer like 0.3.0+build1 is legal in
+        # Cargo.toml but would only fail at the manifest step, after
+        # per-arch images are already pushed.
         run: |
           set -euo pipefail
-          ver=$(cargo metadata --no-deps --format-version 1 \
+          ver=$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "kata-device-plugin") | .version')
           if [[ ! "${ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
             echo "Version '${ver}' from Cargo.toml is not a Docker-tag-safe semver." >&2
