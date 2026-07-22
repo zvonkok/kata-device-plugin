@@ -1,10 +1,11 @@
 name: Release image
 
 # Dispatch-only, NVRC-style: the version is deduced from Cargo.toml — the
-# single source of truth — and preflight creates the matching git tag.  No
-# tag-push trigger, so a hand-pushed tag can never release a mismatched
-# version.  Builds natively on each architecture (no QEMU) and stitches one
-# multi-arch manifest: GB200 nodes pull arm64, HGX nodes pull amd64.
+# single source of truth — and the matching git tag is pushed only after the
+# image manifest is published.  No tag-push trigger, so a hand-pushed tag can
+# never release a mismatched version.  Builds natively on each architecture
+# (no QEMU) and stitches one multi-arch manifest: GB200 nodes pull arm64, HGX
+# nodes pull amd64.
 on:
   workflow_dispatch:
 
@@ -17,11 +18,15 @@ jobs:
   preflight:
     name: Derive version from Cargo.toml
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write # pushes the release tag
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
+      - name: Refuse to release from a non-default branch
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "Releases are cut from ${{ github.event.repository.default_branch }} only, not ${{ github.ref_name }}." >&2
+          exit 1
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
@@ -47,17 +52,6 @@ jobs:
             echo "Tag ${TAG} already exists — bump the version in Cargo.toml first." >&2
             exit 1
           fi
-
-      - name: Create and push the release tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
-        # Via the API rather than git push: checkout runs with
-        # persist-credentials: false (zizmor), so git has no token.
-        run: |
-          set -euo pipefail
-          gh api "repos/${{ github.repository }}/git/refs" \
-            -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}"
 
   build:
     name: Build ${{ matrix.arch }}
@@ -120,3 +114,24 @@ jobs:
             -t "${IMAGE}:${GIT_SHA}" \
             -t "${IMAGE}:latest" \
             "${IMAGE}:${GIT_SHA}-amd64" "${IMAGE}:${GIT_SHA}-arm64"
+
+  tag:
+    name: Push the release tag
+    # Last, deliberately: if a build or the manifest fails, no tag is
+    # created, so nothing ever points at an unreleased commit and the
+    # preflight "tag exists" check can't block the retry.
+    needs: [preflight, manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create the tag via the API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        # The API rather than git push: no checkout, no persisted git
+        # credentials (zizmor).
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}"
