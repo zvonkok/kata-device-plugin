@@ -18,6 +18,8 @@ jobs:
   preflight:
     name: Derive version from Cargo.toml
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read # checkout on private repos; authed tag-existence check
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -54,10 +56,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
           REPO: ${{ github.repository }}
+        # Three-way, not boolean: only a definite 404 means the tag is free.
+        # Auth or transient API failures must stop the release here, not
+        # after the image manifest is already published.
         run: |
           set -euo pipefail
-          if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+          if out=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" 2>&1); then
             echo "Tag ${TAG} already exists — bump the version in Cargo.toml first." >&2
+            exit 1
+          elif grep -q "HTTP 404" <<<"${out}"; then
+            echo "Tag ${TAG} is free."
+          else
+            echo "Tag existence check failed: ${out}" >&2
             exit 1
           fi
 
