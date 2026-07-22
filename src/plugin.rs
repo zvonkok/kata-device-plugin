@@ -199,7 +199,7 @@ impl DevicePlugin for DeviceServer {
                         // The last device vanished: remove the spec so it
                         // can't resolve to device nodes that no longer exist.
                         let cdi_file = cdi::spec_path(&server.cdi_dir, server.resource.name);
-                        if let Err(e) = std::fs::remove_file(&cdi_file) {
+                        if let Err(e) = tokio::fs::remove_file(&cdi_file).await {
                             if e.kind() != std::io::ErrorKind::NotFound {
                                 tracing::warn!(%e, path = %cdi_file.display(), "stale CDI spec removal failed");
                             }

@@ -302,7 +302,7 @@ async fn devices_appearing_after_startup_are_published() {
 /// Remove cdev `vfio<n>` and its fake sysfs entry — the inverse of `add_dev`.
 fn remove_dev(root: &std::path::Path, n: u32) {
     std::fs::remove_file(root.join("devices").join(format!("vfio{n}"))).unwrap();
-    std::fs::remove_dir_all(root.join("sysfs").join(format!("vfio{n}"))).unwrap();
+    std::fs::remove_dir_all(pcilibs_rs::testfs::sysfs(root).join(format!("vfio{n}"))).unwrap();
 }
 
 #[tokio::test]
