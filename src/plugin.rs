@@ -208,11 +208,23 @@ impl DevicePlugin for DeviceServer {
                             }
                         }
                     } else {
-                        match cdi::write_cdi_spec(server.resource.name, &vfio_devs, &server.cdi_dir)
+                        // write_cdi_spec is sync fs I/O; keep it off the
+                        // async workers so a slow disk can't stall gRPC.
+                        let name = server.resource.name;
+                        let devs = vfio_devs.clone();
+                        let dir = server.cdi_dir.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            cdi::write_cdi_spec(name, &devs, &dir)
+                        })
+                        .await
                         {
-                            Ok(()) => true,
-                            Err(e) => {
+                            Ok(Ok(())) => true,
+                            Ok(Err(e)) => {
                                 tracing::warn!("CDI spec write failed: {e:#}");
+                                false
+                            }
+                            Err(e) => {
+                                tracing::warn!("CDI spec write task failed: {e}");
                                 false
                             }
                         }
