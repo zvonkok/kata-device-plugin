@@ -110,11 +110,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push per-arch image
+        # --push: buildx pushes as part of the build; no separate docker push.
         run: |
           set -euxo pipefail
           GIT_SHA=$(git rev-parse --short HEAD)
-          docker build -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
-          docker push "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}"
+          docker build --push -t "${IMAGE}:${GIT_SHA}-${{ matrix.arch }}" --build-arg GIT_SHA="${GIT_SHA}" .
 
   manifest:
     name: Multi-arch manifest
