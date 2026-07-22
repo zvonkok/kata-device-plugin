@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::UnixListener;
@@ -29,6 +30,9 @@ pub const SOCKET_DIR: &str = "/var/lib/kubelet/device-plugins";
 /// Where the host CDI registry lives; the Kata shim reads it at
 /// SandboxCreate.  A runtime contract, not configuration.
 pub const CDI_DIR: &str = "/var/run/cdi";
+
+/// How often ListAndWatch re-scans /dev/vfio/devices/.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Every resource needs its own socket in the kubelet's shared plugin dir:
 /// "nvidia.com/gpu" → "kata-gpu.sock".
@@ -66,13 +70,6 @@ impl DeviceServer {
     }
 
     pub async fn run(self, token: CancellationToken) -> anyhow::Result<()> {
-        // Write the host-side CDI spec before binding the socket so the Kata
-        // shim can resolve our CDI device names as soon as we register.
-        let devices = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource);
-        if let Err(e) = cdi::write_cdi_spec(self.resource.name, &devices, &self.cdi_dir) {
-            tracing::warn!("CDI spec write failed, continuing without it: {e:#}");
-        }
-
         let sock_name = socket_name(self.resource.name);
         let socket = self.socket_dir.join(&sock_name);
         let _ = tokio::fs::remove_file(&socket).await;
@@ -110,11 +107,11 @@ impl DeviceServer {
 
         // Remove the CDI spec on clean shutdown so no stale device paths
         // remain on disk if the node is reconfigured while the plugin is absent.
-        // On crash the file stays, but startup always overwrites it with a fresh scan.
+        // On crash the file stays, but the ListAndWatch poller replaces it from
+        // a fresh scan on the kubelet's first call after restart.
         let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
         match tokio::fs::remove_file(&cdi_file).await {
             Ok(()) => info!(path = %cdi_file.display(), "removed CDI spec on shutdown"),
-            // Nothing was written (no devices) — nothing to clean up.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(%e, path = %cdi_file.display(), "CDI spec removal on shutdown failed")
@@ -124,24 +121,26 @@ impl DeviceServer {
         Ok(())
     }
 
-    /// Device IDs are positions in the sorted enumeration, so they always
-    /// match the CDI spec indices written from the same scan.
-    fn devices(&self) -> Vec<Device> {
-        let devs: Vec<Device> = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource)
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| Device {
-                id: idx.to_string(),
-                health: "Healthy".to_owned(),
-                topology: None,
-            })
-            .collect();
-        info!(
-            count = devs.len(),
-            resource = self.resource.name,
-            "discovered IOMMUFD devices"
-        );
-        devs
+    /// Bring the on-disk CDI spec in line with `devs`: write it from this
+    /// scan, or remove it when no devices remain.  Sync fs work runs off the
+    /// async workers.  Callers decide the failure policy: the poller retries
+    /// on the next tick, Allocate fails the RPC.
+    async fn sync_cdi_spec(&self, devs: &[vfio::IommufdDev]) -> anyhow::Result<()> {
+        if devs.is_empty() {
+            let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
+            match tokio::fs::remove_file(&cdi_file).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("remove {}", cdi_file.display())),
+            }
+        } else {
+            let name = self.resource.name;
+            let devs = devs.to_vec();
+            let dir = self.cdi_dir.clone();
+            tokio::task::spawn_blocking(move || cdi::write_cdi_spec(name, &devs, &dir))
+                .await
+                .context("CDI spec write task")?
+        }
     }
 }
 
@@ -192,17 +191,64 @@ impl DevicePlugin for DeviceServer {
         &self,
         _: Request<Empty>,
     ) -> Result<Response<Self::ListAndWatchStream>, Status> {
-        use futures::StreamExt;
-        let resp = ListAndWatchResponse {
-            devices: self.devices(),
-        };
-        // Send one snapshot, then hold the stream open: the kubelet treats a
-        // completed ListAndWatch stream as endpoint death and marks the
-        // resource unhealthy.  The advertised set is fixed for the plugin's
-        // lifetime; a device-set change means the pod is restarted.
-        let stream = futures::stream::once(futures::future::ready(Ok(resp)))
-            .chain(futures::stream::pending());
-        Ok(Response::new(Box::pin(stream)))
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let server = self.clone();
+        tokio::spawn(async move {
+            // Two independent trackers: `sent` is what the kubelet last saw,
+            // `synced` is what the on-disk CDI spec reflects.  A CDI failure
+            // must retry next tick without re-sending an identical device
+            // list every 5s (kubelet churn); a device change must reach the
+            // kubelet even while the CDI registry is briefly unwritable.
+            let mut sent: Option<Vec<u32>> = None;
+            let mut synced: Option<Vec<u32>> = None;
+            loop {
+                // Exit when the kubelet drops the stream, even if the device
+                // set never changes again — otherwise this task would poll
+                // forever across kubelet reconnects.
+                if tx.is_closed() {
+                    break;
+                }
+
+                let vfio_devs =
+                    vfio::enumerate(&server.device_dir, &server.sysfs_dir, &server.resource);
+                // Compare the backing cdev numbers, not the advertised Device
+                // list: IDs are just indices 0..n, so a same-count swap
+                // (vfio7 gone, vfio9 new) would look identical to the kubelet
+                // while the CDI spec's index → cdev mapping went stale.
+                let nums: Vec<u32> = vfio_devs.iter().map(|d| d.num).collect();
+
+                if Some(&nums) != synced.as_ref() {
+                    match server.sync_cdi_spec(&vfio_devs).await {
+                        Ok(()) => synced = Some(nums.clone()),
+                        Err(e) => tracing::warn!("CDI spec sync failed, retrying: {e:#}"),
+                    }
+                }
+
+                if Some(&nums) != sent.as_ref() {
+                    info!(
+                        count = nums.len(),
+                        resource = server.resource.name,
+                        "device list changed"
+                    );
+                    let devices = (0..nums.len())
+                        .map(|idx| Device {
+                            id: idx.to_string(),
+                            health: "Healthy".to_owned(),
+                            topology: None,
+                        })
+                        .collect();
+                    sent = Some(nums);
+                    if tx.send(Ok(ListAndWatchResponse { devices })).await.is_err() {
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn get_preferred_allocation(
@@ -219,21 +265,41 @@ impl DevicePlugin for DeviceServer {
         req: Request<AllocateRequest>,
     ) -> Result<Response<AllocateResponse>, Status> {
         let resource_name = self.resource.name;
-        let responses = req
-            .into_inner()
-            .container_requests
-            .into_iter()
-            .map(|cr| ContainerAllocateResponse {
-                cdi_devices: cr
-                    .devices_i_ds
-                    .into_iter()
-                    .map(|id| CdiDevice {
+        // The device set can shrink between scheduling and Allocate.  Check
+        // the requested IDs against a fresh enumeration so a stale ID fails
+        // loudly here instead of as an unresolvable CDI name in the shim.
+        let devs = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource);
+        let present = devs.len();
+        // The names below only work if the shim can resolve them at
+        // SandboxCreate.  Sync the spec from the very enumeration we validate
+        // against; if the CDI registry can't be written, fail the RPC now
+        // instead of succeeding and producing an opaque runtime failure.
+        if let Err(e) = self.sync_cdi_spec(&devs).await {
+            return Err(Status::unavailable(format!(
+                "CDI registry for {resource_name} is not writable: {e:#}"
+            )));
+        }
+        let mut responses = Vec::new();
+        for cr in req.into_inner().container_requests {
+            let mut cdi_devices = Vec::new();
+            for id in cr.devices_i_ds {
+                match id.parse::<usize>() {
+                    Ok(idx) if idx < present => cdi_devices.push(CdiDevice {
                         name: format!("{resource_name}={id}"),
-                    })
-                    .collect(),
+                    }),
+                    _ => {
+                        return Err(Status::not_found(format!(
+                            "device {id} of {resource_name} is no longer present \
+                             ({present} devices bound)"
+                        )))
+                    }
+                }
+            }
+            responses.push(ContainerAllocateResponse {
+                cdi_devices,
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
         Ok(Response::new(AllocateResponse {
             container_responses: responses,
         }))

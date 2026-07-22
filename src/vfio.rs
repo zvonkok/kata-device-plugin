@@ -1,104 +1,55 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Where the kernel exposes VFIO; IOMMUFD cdevs live under
-/// `/dev/vfio/devices/`.  Not configurable — the kernel decides.
-/// Tests inject a temp dir via `DeviceServer::new` instead.
-pub const VFIO_DIR: &str = "/dev/vfio";
+pub use pcilibs_rs::{
+    enumerate_iommufd as enumerate_all, IommufdDev, IOMMUFD_SYSFS_CLASS as SYSFS_DIR,
+    IOMMUFD_VFIO_DIR as VFIO_DIR,
+};
 
-/// Sysfs class directory for VFIO cdevs; `<SYSFS_DIR>/vfio<N>/device`
-/// links to the PCI device, whose `vendor` and `class` files identify
-/// what is behind the cdev.  A kernel contract, like `VFIO_DIR`.
-pub const SYSFS_DIR: &str = "/sys/class/vfio-dev";
-
-/// One advertised resource: a Kubernetes extended-resource name declared by
-/// a PCI (vendor, class prefix) match against `/sys/class/vfio-dev`.
+/// One advertised Kubernetes resource: an extended-resource name bound to a
+/// (PCI vendor, PCI class) pair.  A resource is advertised iff matching
+/// IOMMUFD devices are present.  Supporting a new device type is one row —
+/// no other code changes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Resource {
     /// Kubernetes extended-resource name; also the CDI kind.
     pub name: &'static str,
-    /// PCI vendor id as sysfs prints it, e.g. "0x10de".
-    pub vendor: &'static str,
-    /// PCI class code prefix as sysfs prints it, e.g. "0x0302".
-    pub class_prefix: &'static str,
+    /// PCI vendor ID, e.g. `0x10de` for NVIDIA.
+    pub vendor: u16,
+    /// Upper 16 bits of the 24-bit PCI class (class byte | subclass byte),
+    /// e.g. `0x0302` for 3D controller.
+    pub class_prefix: u16,
 }
 
-/// Everything this plugin can advertise.  A resource is advertised iff
-/// matching devices are VFIO-bound — declared by the node, not configured.
-/// Supporting a new device type is one new row; no other code changes.
+/// Everything this plugin can advertise.  Declared by the node — a resource
+/// is advertised iff matching devices are VFIO-bound.
 pub const RESOURCES: &[Resource] = &[
     Resource {
         name: "nvidia.com/gpu",
-        vendor: "0x10de",
-        class_prefix: "0x0302", // 3D controller
+        vendor: 0x10de,
+        class_prefix: 0x0302, // 3D controller
     },
     Resource {
         name: "nvidia.com/nvswitch",
-        vendor: "0x10de",
-        class_prefix: "0x0680", // bridge: other
+        vendor: 0x10de,
+        class_prefix: 0x0680, // bridge: other
     },
 ];
 
-/// One IOMMUFD cdev: `/dev/vfio/devices/vfio<num>`.
-#[derive(Clone, Debug)]
-pub struct VfioDev {
-    pub num: u32,
-    pub path: PathBuf,
-}
-
-/// Enumerate IOMMUFD cdevs under `<vfio_dir>/devices/` whose PCI identity
-/// matches `res`, sorted numerically.  Positions in the returned Vec are the
-/// advertised device IDs / CDI spec indices.
-pub fn enumerate(vfio_dir: &Path, sysfs_dir: &Path, res: &Resource) -> Vec<VfioDev> {
-    let devices_dir = vfio_dir.join("devices");
-    let Ok(rd) = std::fs::read_dir(&devices_dir) else {
-        return vec![];
-    };
-    let mut nums: Vec<u32> = rd
-        .flatten()
-        .filter_map(|e| {
-            e.file_name()
-                .to_str()?
-                .strip_prefix("vfio")?
-                .parse::<u32>()
-                .ok()
-        })
-        .filter(|&n| matches(sysfs_dir, n, res))
-        .collect();
-    nums.sort();
-    nums.into_iter()
-        .map(|num| VfioDev {
-            num,
-            path: devices_dir.join(format!("vfio{num}")),
-        })
+/// Enumerate IOMMUFD cdevs under `vfio_dir` whose PCI identity matches `res`,
+/// sorted numerically.
+pub fn enumerate(vfio_dir: &Path, sysfs_dir: &Path, res: &Resource) -> Vec<IommufdDev> {
+    pcilibs_rs::enumerate_iommufd(vfio_dir, sysfs_dir)
+        .into_iter()
+        .filter(|d| d.vendor == res.vendor && d.class_prefix() == res.class_prefix)
         .collect()
 }
 
-fn matches(sysfs_dir: &Path, num: u32, res: &Resource) -> bool {
-    let device = sysfs_dir.join(format!("vfio{num}")).join("device");
-    let read = |name: &str| std::fs::read_to_string(device.join(name)).unwrap_or_default();
-    read("vendor").trim() == res.vendor && read("class").trim().starts_with(res.class_prefix)
-}
-
-/// Fake node layout for unit tests, under one root:
-///   `<root>/devices/vfio<n>`                       — the cdev entry
-///   `<root>/sysfs/vfio<n>/device/{vendor,class}`   — fake sysfs
+/// NVIDIA-flavoured wrappers over pcilibs-rs's `testfs` fixtures.
 #[cfg(test)]
 pub(crate) mod testfs {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    pub fn sysfs(root: &Path) -> PathBuf {
-        root.join("sysfs")
-    }
-
-    pub fn add(root: &Path, n: u32, vendor: &str, class: &str) {
-        let devices = root.join("devices");
-        std::fs::create_dir_all(&devices).unwrap();
-        std::fs::write(devices.join(format!("vfio{n}")), b"").unwrap();
-        let device = sysfs(root).join(format!("vfio{n}")).join("device");
-        std::fs::create_dir_all(&device).unwrap();
-        std::fs::write(device.join("vendor"), format!("{vendor}\n")).unwrap();
-        std::fs::write(device.join("class"), format!("{class}\n")).unwrap();
-    }
+    pub use pcilibs_rs::testfs::{add, sysfs};
 
     pub fn add_gpu(root: &Path, n: u32) {
         add(root, n, "0x10de", "0x030200");
