@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::UnixListener;
@@ -29,6 +30,9 @@ pub const SOCKET_DIR: &str = "/var/lib/kubelet/device-plugins";
 /// Where the host CDI registry lives; the Kata shim reads it at
 /// SandboxCreate.  A runtime contract, not configuration.
 pub const CDI_DIR: &str = "/var/run/cdi";
+
+/// How often ListAndWatch re-scans /dev/vfio/devices/.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Every resource needs its own socket in the kubelet's shared plugin dir:
 /// "nvidia.com/gpu" → "kata-gpu.sock".
@@ -66,13 +70,6 @@ impl DeviceServer {
     }
 
     pub async fn run(self, token: CancellationToken) -> anyhow::Result<()> {
-        // Write the host-side CDI spec before binding the socket so the Kata
-        // shim can resolve our CDI device names as soon as we register.
-        let devices = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource);
-        if let Err(e) = cdi::write_cdi_spec(self.resource.name, &devices, &self.cdi_dir) {
-            tracing::warn!("CDI spec write failed, continuing without it: {e:#}");
-        }
-
         let sock_name = socket_name(self.resource.name);
         let socket = self.socket_dir.join(&sock_name);
         let _ = tokio::fs::remove_file(&socket).await;
@@ -114,7 +111,6 @@ impl DeviceServer {
         let cdi_file = cdi::spec_path(&self.cdi_dir, self.resource.name);
         match tokio::fs::remove_file(&cdi_file).await {
             Ok(()) => info!(path = %cdi_file.display(), "removed CDI spec on shutdown"),
-            // Nothing was written (no devices) — nothing to clean up.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(%e, path = %cdi_file.display(), "CDI spec removal on shutdown failed")
@@ -122,26 +118,6 @@ impl DeviceServer {
         }
 
         Ok(())
-    }
-
-    /// Device IDs are positions in the sorted enumeration, so they always
-    /// match the CDI spec indices written from the same scan.
-    fn devices(&self) -> Vec<Device> {
-        let devs: Vec<Device> = vfio::enumerate(&self.device_dir, &self.sysfs_dir, &self.resource)
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| Device {
-                id: idx.to_string(),
-                health: "Healthy".to_owned(),
-                topology: None,
-            })
-            .collect();
-        info!(
-            count = devs.len(),
-            resource = self.resource.name,
-            "discovered IOMMUFD devices"
-        );
-        devs
     }
 }
 
@@ -192,17 +168,52 @@ impl DevicePlugin for DeviceServer {
         &self,
         _: Request<Empty>,
     ) -> Result<Response<Self::ListAndWatchStream>, Status> {
-        use futures::StreamExt;
-        let resp = ListAndWatchResponse {
-            devices: self.devices(),
-        };
-        // Send one snapshot, then hold the stream open: the kubelet treats a
-        // completed ListAndWatch stream as endpoint death and marks the
-        // resource unhealthy.  The advertised set is fixed for the plugin's
-        // lifetime; a device-set change means the pod is restarted.
-        let stream = futures::stream::once(futures::future::ready(Ok(resp)))
-            .chain(futures::stream::pending());
-        Ok(Response::new(Box::pin(stream)))
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut last: Option<Vec<Device>> = None;
+            loop {
+                let vfio_devs =
+                    vfio::enumerate(&server.device_dir, &server.sysfs_dir, &server.resource);
+                let current: Vec<Device> = vfio_devs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| Device {
+                        id: idx.to_string(),
+                        health: "Healthy".to_owned(),
+                        topology: None,
+                    })
+                    .collect();
+
+                if Some(&current) != last.as_ref() {
+                    info!(
+                        count = current.len(),
+                        resource = server.resource.name,
+                        "device list changed"
+                    );
+                    if !vfio_devs.is_empty() {
+                        if let Err(e) =
+                            cdi::write_cdi_spec(server.resource.name, &vfio_devs, &server.cdi_dir)
+                        {
+                            tracing::warn!("CDI spec write failed: {e:#}");
+                        }
+                    }
+                    last = Some(current.clone());
+                    if tx
+                        .send(Ok(ListAndWatchResponse { devices: current }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn get_preferred_allocation(

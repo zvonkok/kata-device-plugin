@@ -7,7 +7,7 @@ use container_device_interface::specs::config::{
 };
 use tracing::info;
 
-use crate::vfio::VfioDev;
+use pcilibs_rs::IommufdDev;
 
 /// Path of the CDI spec file for `resource_name` inside `cdi_dir`:
 /// "nvidia.com/gpu" → `<cdi_dir>/kata.nvidia.com-gpu.yaml`.  The `kata.`
@@ -23,7 +23,7 @@ pub fn spec_path(cdi_dir: &Path, resource_name: &str) -> PathBuf {
 /// name itself.
 pub fn write_cdi_spec(
     resource_name: &str,
-    devices: &[VfioDev],
+    devices: &[IommufdDev],
     cdi_dir: &Path,
 ) -> anyhow::Result<()> {
     if devices.is_empty() {
@@ -76,15 +76,14 @@ pub fn write_cdi_spec(
 mod tests {
     use super::*;
     use crate::vfio::{self, testfs, Resource, RESOURCES};
+    use pcilibs_rs::IommufdDev;
     use tempfile::TempDir;
 
     fn by_name(name: &str) -> &'static Resource {
         RESOURCES.iter().find(|r| r.name == name).unwrap()
     }
 
-    /// Create fake GPU cdevs under `root` and return them enumerated —
-    /// same path write_cdi_spec's callers use.
-    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<VfioDev> {
+    fn gpu_devs(root: &TempDir, nums: &[u32]) -> Vec<IommufdDev> {
         for n in nums {
             testfs::add_gpu(root.path(), *n);
         }

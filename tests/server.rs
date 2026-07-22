@@ -13,6 +13,7 @@ use kata_device_plugin::dp::v1beta1::{
 };
 use kata_device_plugin::plugin::DeviceServer;
 use kata_device_plugin::vfio::{Resource, RESOURCES};
+use pcilibs_rs::testfs::add as add_dev;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -51,18 +52,6 @@ impl Registration for MockKubelet {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Fake /dev/vfio layout under one temp root:
-/// `<root>/devices/vfio<n>` + `<root>/sysfs/vfio<n>/device/{vendor,class}`.
-fn add_dev(root: &std::path::Path, n: u32, vendor: &str, class: &str) {
-    let devices = root.join("devices");
-    std::fs::create_dir_all(&devices).unwrap();
-    std::fs::write(devices.join(format!("vfio{n}")), b"").unwrap();
-    let device = root.join("sysfs").join(format!("vfio{n}")).join("device");
-    std::fs::create_dir_all(&device).unwrap();
-    std::fs::write(device.join("vendor"), format!("{vendor}\n")).unwrap();
-    std::fs::write(device.join("class"), format!("{class}\n")).unwrap();
-}
 
 /// n GPU cdevs (vfio0..vfio(n-1)); n = 0 gives an empty devices dir.
 fn fake_vfio(n: u32) -> TempDir {
@@ -274,6 +263,38 @@ async fn empty_vfio_dir_advertises_no_devices() {
     let (_stream, resp) = node.snapshot("kata-gpu.sock").await;
     assert_eq!(resp.devices.len(), 0);
     assert!(node.spec("kata.nvidia.com-gpu.yaml").is_none());
+
+    node.shutdown().await;
+}
+
+#[tokio::test]
+async fn devices_appearing_after_startup_are_published() {
+    // Start with an empty dir, then add a GPU cdev — simulates VFIO binding
+    // racing DP startup.  The watcher must pick up the new device and push an
+    // updated ListAndWatch response.
+    let vfio = TempDir::new().unwrap();
+    std::fs::create_dir(vfio.path().join("devices")).unwrap();
+
+    let node = Node::start(vfio, &["nvidia.com/gpu"]).await;
+
+    let (mut stream, first) = node.snapshot("kata-gpu.sock").await;
+    assert_eq!(first.devices.len(), 0, "must start with zero devices");
+
+    // Simulate the VFIO cdev appearing after the DP is already running.
+    add_dev(node._vfio.path(), 0, "0x10de", "0x030200");
+
+    // The watcher polls every POLL_INTERVAL (5 s in prod; the test overrides
+    // nothing, so we wait for the next natural tick).  Give it up to 10 s.
+    let updated = tokio::time::timeout(Duration::from_secs(10), stream.message())
+        .await
+        .expect("timed out waiting for updated ListAndWatch response")
+        .unwrap()
+        .expect("stream closed");
+    assert_eq!(updated.devices.len(), 1);
+    assert!(
+        node.spec("kata.nvidia.com-gpu.yaml").is_some(),
+        "CDI spec written after device appeared"
+    );
 
     node.shutdown().await;
 }

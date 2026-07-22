@@ -2,8 +2,6 @@
 
 use kata_device_plugin::{plugin, vfio};
 
-use std::path::Path;
-
 use plugin::DeviceServer;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -32,33 +30,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Declared by the node, not configured: advertise exactly the RESOURCES
     // rows that have VFIO-bound devices.
-    let mut servers = Vec::new();
-    for res in vfio::RESOURCES {
-        let devs = vfio::enumerate(Path::new(vfio::VFIO_DIR), Path::new(vfio::SYSFS_DIR), res);
-        if devs.is_empty() {
-            info!(
-                resource = res.name,
-                "no matching VFIO devices, not advertising"
-            );
-            continue;
-        }
-        info!(resource = res.name, count = devs.len(), "advertising");
-        servers.push(DeviceServer::new(
-            *res,
-            vfio::VFIO_DIR,
-            vfio::SYSFS_DIR,
-            plugin::SOCKET_DIR,
-            plugin::CDI_DIR,
-        ));
-    }
-    if servers.is_empty() {
-        // Nothing to declare.  Stay up quietly: the advertised set is fixed
-        // for the plugin's lifetime, and a device-set change on the node
-        // means this pod gets restarted.
-        info!("no VFIO devices for any known resource");
-        shutdown.cancelled().await;
-        return Ok(());
-    }
+    // Start one server per known resource unconditionally.  Each server's
+    // watcher task polls for VFIO devices and pushes updates into
+    // ListAndWatch, so late-appearing devices (VFIO binding races the DP
+    // startup) are picked up without restarting the pod.
+    let servers: Vec<_> = vfio::RESOURCES
+        .iter()
+        .map(|res| {
+            info!(resource = res.name, "starting plugin");
+            DeviceServer::new(
+                *res,
+                vfio::VFIO_DIR,
+                vfio::SYSFS_DIR,
+                plugin::SOCKET_DIR,
+                plugin::CDI_DIR,
+            )
+        })
+        .collect();
 
     let results =
         futures::future::join_all(servers.into_iter().map(|s| s.run(shutdown.clone()))).await;
